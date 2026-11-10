@@ -1,10 +1,10 @@
-"""API routes: preset + global rules, sessions (SSE turns), memory, labels, import, models."""
+"""API routes: preset + global rules, sessions (SSE turns), memory, labels, models."""
 
 import json
 from collections.abc import AsyncIterator
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlmodel import Session, select
@@ -13,10 +13,14 @@ from app.api.crud import crud_router
 from app.clients.openrouter import OpenRouterError
 from app.db import get_db
 from app.harness.orchestrator import Harness, initial_labels, opening_message
-from app.importers.sillytavern import CardError, card_to_entities, parse_card_bytes
 from app.models import (
+    Assignment,
+    AssignmentBase,
     Character,
     CharacterBase,
+    Competency,
+    CompetencyBase,
+    Evaluation,
     GlobalRule,
     GlobalRuleBase,
     LoreEntry,
@@ -26,47 +30,90 @@ from app.models import (
     Message,
     Persona,
     PersonaBase,
+    Profile,
+    ProfileBase,
     PromptPreset,
     PromptPresetBase,
-    RoleplaySession,
     Scenario,
     ScenarioBase,
+    ScenarioCompetency,
+    ScenarioCompetencyBase,
     SessionBase,
+    StateVariable,
+    StateVariableBase,
+    TrainingSession,
     TurnTrace,
 )
 from app.prompt.blocks import BLOCK_LABELS, REQUIRED_BLOCKS, normalize_block_order
 from app.sage.labels import Label, LabelSet
 from app.sage.registry import REGISTRY
+from app.training import state as sim_state
+from app.training.report import complete_session, refresh_report, results_table
+from app.training.validation import (
+    check_competency,
+    check_profile,
+    check_scenario_competency,
+    check_state_variable,
+)
 
 router = APIRouter(prefix="/api")
+
+REASONING_MODES = ("off", "auto", "on")
 
 
 def harness_of(request: Request) -> Harness:
     return request.app.state.harness
 
 
-# ----------------------------------------------------------------- world building
+# ----------------------------------------------------------------- scenario building
+
+
+def _delete_where(db: Session, model: Any, **filters: Any) -> None:
+    query = select(model)
+    for field, value in filters.items():
+        query = query.where(getattr(model, field) == value)
+    for row in db.exec(query):
+        db.delete(row)
 
 
 def _delete_scenario_children(db: Session, scenario: Scenario) -> None:
-    for model in (Character, LoreEntry, Persona):
-        for row in db.exec(select(model).where(model.scenario_id == scenario.id)):
-            db.delete(row)
-    for session in db.exec(select(RoleplaySession).where(RoleplaySession.scenario_id == scenario.id)):
+    for model in (Character, LoreEntry, Persona, ScenarioCompetency, StateVariable, Assignment):
+        _delete_where(db, model, scenario_id=scenario.id)
+    for session in db.exec(select(TrainingSession).where(TrainingSession.scenario_id == scenario.id)):
         _delete_session_children(db, session)
         db.delete(session)
 
 
-def _delete_session_children(db: Session, session: RoleplaySession) -> None:
-    for model in (Message, MemoryItem, TurnTrace):
-        for row in db.exec(select(model).where(model.session_id == session.id)):
-            db.delete(row)
+def _delete_session_children(db: Session, session: TrainingSession) -> None:
+    for model in (Message, MemoryItem, TurnTrace, Evaluation):
+        _delete_where(db, model, session_id=session.id)
 
 
 router.include_router(crud_router(Scenario, ScenarioBase, "/scenarios", "scenario", on_delete=_delete_scenario_children))
 router.include_router(crud_router(Character, CharacterBase, "/characters", "character", parent_field="scenario_id"))
 router.include_router(crud_router(LoreEntry, LoreEntryBase, "/lore", "lore", parent_field="scenario_id"))
 router.include_router(crud_router(Persona, PersonaBase, "/personas", "persona", parent_field="scenario_id"))
+router.include_router(
+    crud_router(StateVariable, StateVariableBase, "/state-variables", "state variable",
+                parent_field="scenario_id", validate=check_state_variable)
+)
+router.include_router(
+    crud_router(ScenarioCompetency, ScenarioCompetencyBase, "/scenario-competencies", "scenario competency",
+                parent_field="scenario_id", validate=check_scenario_competency)
+)
+
+
+# ----------------------------------------------------------------- company: profiles, library, assignments
+
+router.include_router(
+    crud_router(Profile, ProfileBase, "/profiles", "profile", validate=check_profile,
+                on_delete=lambda db, p: _delete_where(db, Assignment, profile_id=p.id))
+)
+router.include_router(
+    crud_router(Competency, CompetencyBase, "/competencies", "competency", validate=check_competency,
+                on_delete=lambda db, c: _delete_where(db, ScenarioCompetency, competency_id=c.id))
+)
+router.include_router(crud_router(Assignment, AssignmentBase, "/assignments", "assignment", parent_field="scenario_id"))
 
 
 # ----------------------------------------------------------------- preset + global rules
@@ -97,8 +144,9 @@ def update_preset(payload: dict[str, Any], db: Session = Depends(get_db)) -> dic
     for key in allowed:
         setattr(preset, key, getattr(data, key))
     preset.block_order = normalize_block_order(preset.block_order)
-    if preset.sage_reasoning not in ("off", "auto", "on"):
-        raise HTTPException(400, "sage_reasoning must be off, auto or on")
+    for field in ("sage_reasoning", "evaluation_reasoning"):
+        if getattr(preset, field) not in REASONING_MODES:
+            raise HTTPException(400, f"{field} must be off, auto or on")
     db.add(preset)
     db.commit()
     return get_preset(db)
@@ -115,10 +163,19 @@ class SessionCreate(SessionBase):
 
 
 @router.get("/sessions")
-def list_sessions(scenario_id: int | None = None, db: Session = Depends(get_db)) -> list[dict[str, Any]]:
-    query = select(RoleplaySession).order_by(RoleplaySession.created_at.desc())
+def list_sessions(
+    scenario_id: int | None = None,
+    profile_id: int | None = None,
+    status: str | None = None,
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    query = select(TrainingSession).order_by(TrainingSession.created_at.desc())
     if scenario_id is not None:
-        query = query.where(RoleplaySession.scenario_id == scenario_id)
+        query = query.where(TrainingSession.scenario_id == scenario_id)
+    if profile_id is not None:
+        query = query.where(TrainingSession.profile_id == profile_id)
+    if status is not None:
+        query = query.where(TrainingSession.status == status)
     return [s.model_dump() for s in db.exec(query)]
 
 
@@ -130,10 +187,13 @@ def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> dic
     persona = db.get(Persona, payload.persona_id) if payload.persona_id else None
     if payload.persona_id and (persona is None or persona.scenario_id != scenario.id):
         raise HTTPException(400, "persona does not belong to this scenario")
+    if payload.profile_id is not None and db.get(Profile, payload.profile_id) is None:
+        raise HTTPException(404, "profile not found")
     characters = list(db.exec(select(Character).where(Character.scenario_id == scenario.id).order_by(Character.id)))
-    session = RoleplaySession.model_validate(payload.model_dump())
+    session = TrainingSession.model_validate(payload.model_dump())
     session.title = session.title or scenario.title
-    session.labels = initial_labels(characters).model_dump()
+    variables = list(db.exec(select(StateVariable).where(StateVariable.scenario_id == scenario.id)))
+    session.labels = initial_labels(characters, variables).model_dump()
     db.add(session)
     db.commit()
     db.refresh(session)
@@ -145,8 +205,8 @@ def create_session(payload: SessionCreate, db: Session = Depends(get_db)) -> dic
     return result
 
 
-def _session(db: Session, session_id: int) -> RoleplaySession:
-    session = db.get(RoleplaySession, session_id)
+def _session(db: Session, session_id: int) -> TrainingSession:
+    session = db.get(TrainingSession, session_id)
     if session is None:
         raise HTTPException(404, "session not found")
     return session
@@ -160,7 +220,7 @@ def get_session(session_id: int, db: Session = Depends(get_db)) -> dict[str, Any
 @router.patch("/sessions/{session_id}")
 def update_session(session_id: int, payload: dict[str, Any], db: Session = Depends(get_db)) -> dict[str, Any]:
     session = _session(db, session_id)
-    for key in ("title", "model", "persona_id", "authors_note", "authors_note_depth", "authors_note_frequency", "summary", "pacing_note"):
+    for key in ("title", "model", "persona_id", "profile_id", "authors_note", "authors_note_depth", "authors_note_frequency", "summary", "pacing_note"):
         if key in payload:
             setattr(session, key, payload[key])
     db.add(session)
@@ -303,12 +363,91 @@ def delete_memory(item_id: int, db: Session = Depends(get_db)) -> dict[str, bool
     return {"ok": True}
 
 
+# ----------------------------------------------------------------- evaluations
+
+
+@router.get("/sessions/{session_id}/evaluations")
+def list_evaluations(session_id: int, db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    _session(db, session_id)
+    rows = db.exec(select(Evaluation).where(Evaluation.session_id == session_id).order_by(Evaluation.turn_index, Evaluation.id))
+    return [e.model_dump() for e in rows]
+
+
+class EvaluationPatch(BaseModel):
+    score: float
+    note: str = ""
+
+
+@router.patch("/evaluations/{evaluation_id}")
+def correct_evaluation(evaluation_id: int, payload: EvaluationPatch, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """The manager sets the rubric level. A corrected row is no longer in review and a
+    later regenerate keeps it."""
+    row = db.get(Evaluation, evaluation_id)
+    if row is None:
+        raise HTTPException(404, "evaluation not found")
+    competency = db.get(Competency, row.competency_id)
+    levels = [lv["level"] for lv in competency.levels] if competency else []
+    if levels and not min(levels) <= payload.score <= max(levels):
+        raise HTTPException(400, f"score must be between {min(levels)} and {max(levels)}")
+    row.score, row.note = payload.score, payload.note
+    row.source, row.needs_review, row.review_reason, row.confidence = "manager", False, "", 1.0
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    result = row.model_dump()
+    _refresh_if_completed(db, row.session_id)
+    return result
+
+
+def _refresh_if_completed(db: Session, session_id: int) -> None:
+    session = db.get(TrainingSession, session_id)
+    if session is not None and session.status == "completed":
+        refresh_report(db, session)
+
+
+@router.delete("/evaluations/{evaluation_id}")
+def delete_evaluation(evaluation_id: int, db: Session = Depends(get_db)) -> dict[str, bool]:
+    """The manager discards a row (for example: the competency was not really shown)."""
+    row = db.get(Evaluation, evaluation_id)
+    if row is None:
+        raise HTTPException(404, "evaluation not found")
+    session_id = row.session_id
+    db.delete(row)
+    db.commit()
+    _refresh_if_completed(db, session_id)
+    return {"ok": True}
+
+
+# ----------------------------------------------------------------- completion, report, results
+
+
+@router.post("/sessions/{session_id}/complete")
+async def complete(session_id: int, request: Request, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """End the simulation and build the report. Calling it again rebuilds the report."""
+    session = _session(db, session_id)
+    harness = harness_of(request)
+    report = await complete_session(db, session, harness.openrouter, harness.settings.summary_model)
+    return {"status": session.status, "report": report}
+
+
+@router.get("/sessions/{session_id}/report")
+def get_report(session_id: int, db: Session = Depends(get_db)) -> dict[str, Any]:
+    session = _session(db, session_id)
+    return {"status": session.status, "completed_at": session.completed_at, "report": session.report or None}
+
+
+@router.get("/results")
+def results(scenario_id: int | None = None, db: Session = Depends(get_db)) -> dict[str, Any]:
+    return results_table(db, scenario_id)
+
+
 # ----------------------------------------------------------------- labels
 
 
 @router.get("/sessions/{session_id}/labels")
 def get_labels(session_id: int, db: Session = Depends(get_db)) -> dict[str, Any]:
     session = _session(db, session_id)
+    variables = sim_state.active(list(db.exec(select(StateVariable).where(StateVariable.scenario_id == session.scenario_id))))
     return {
         "labels": LabelSet.from_json(session.labels).model_dump(),
         "registry": [
@@ -316,6 +455,7 @@ def get_labels(session_id: int, db: Session = Depends(get_db)) -> dict[str, Any]
              "renders_to": s.renders_to, "threshold": s.threshold, "lockable": s.lockable}
             for s in REGISTRY
         ],
+        "state_variables": [{**v.model_dump(), "key": sim_state.state_key(v.id)} for v in variables],
     }
 
 
@@ -330,6 +470,9 @@ def patch_label(session_id: int, payload: LabelPatch, db: Session = Depends(get_
     """Lock a label to a user value, or unlock it (locked=false keeps the value)."""
     session = _session(db, session_id)
     lockable = {s.key for s in REGISTRY if s.lockable}
+    variable = db.get(StateVariable, sim_state.variable_id(payload.key) or 0)
+    if variable is not None and variable.scenario_id == session.scenario_id:
+        lockable.add(payload.key)
     if payload.key not in lockable:
         raise HTTPException(400, f"label {payload.key} cannot be set by the user")
     labels = LabelSet.from_json(session.labels)
@@ -344,28 +487,7 @@ def patch_label(session_id: int, payload: LabelPatch, db: Session = Depends(get_
     return labels.model_dump()
 
 
-# ----------------------------------------------------------------- import, models, health
-
-
-@router.post("/import/card")
-async def import_card(file: UploadFile = File(...), db: Session = Depends(get_db)) -> dict[str, Any]:
-    data = await file.read()
-    if len(data) > 20 * 1024 * 1024:
-        raise HTTPException(413, "file is larger than 20 MB")
-    try:
-        entities = card_to_entities(parse_card_bytes(data, file.filename or ""))
-    except CardError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    scenario = Scenario(**entities["scenario"])
-    db.add(scenario)
-    db.commit()
-    db.refresh(scenario)
-    result = scenario.model_dump()
-    db.add(Character(**entities["character"], scenario_id=scenario.id))
-    for entry in entities["lore"]:
-        db.add(LoreEntry(**entry, scenario_id=scenario.id))
-    db.commit()
-    return {"scenario": result, "lore_count": len(entities["lore"])}
+# ----------------------------------------------------------------- models, health
 
 
 @router.get("/models")

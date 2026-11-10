@@ -28,11 +28,12 @@ def build_harness(settings: Settings) -> Harness:
 def create_app(harness: Harness | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        init_db()
-        app.state.harness = harness or build_harness(get_settings())
+        settings = harness.settings if harness else get_settings()
+        init_db(sample_data=settings.sample_data)
+        app.state.harness = harness or build_harness(settings)
         yield
 
-    app = FastAPI(title="Roleplay Harness", lifespan=lifespan)
+    app = FastAPI(title="Training Agent", lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],

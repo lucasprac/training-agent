@@ -28,9 +28,10 @@ class Settings(BaseSettings):
     default_model: str = "anthropic/claude-sonnet-5.5"
     summary_model: str = "deepseek/deepseek-v4.1-flash"
 
-    database_url: str = f"sqlite:///{(BACKEND_DIR / 'data' / 'roleplay.db').as_posix()}"
+    database_url: str = f"sqlite:///{(BACKEND_DIR / 'data' / 'training.db').as_posix()}"
     app_url: str = "http://localhost:5173"
-    app_title: str = "Roleplay Harness"
+    app_title: str = "Training Agent"
+    sample_data: bool = True  # a sample manager, trainee and scenario on a new database
 
 
 @lru_cache

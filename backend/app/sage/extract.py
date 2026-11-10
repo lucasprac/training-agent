@@ -10,7 +10,7 @@ place name when the scene moved to a place that is not in the lorebook.
 import re
 from typing import Any
 
-from app.models import Character
+from app.models import Character, StateVariable
 
 MAX_SENTENCES = 24
 MIN_WORDS = 3
@@ -61,6 +61,36 @@ def candidate_sentences(
                 seen.add(key)
                 out.append(candidate)
     return out[:MAX_SENTENCES]
+
+
+MAX_EXTRACT_FIELDS = 64  # Sage /v1/extract limit
+
+
+def state_field(variable_id: int | None) -> str:
+    return f"s{variable_id}"
+
+
+def state_schema(variables: list[StateVariable]) -> dict[str, Any]:
+    """One typed field per Extract variable: {"s12": {"type": "decimal", "definition": "..."}}."""
+    schema: dict[str, Any] = {}
+    for var in variables[:MAX_EXTRACT_FIELDS]:
+        definition = " ".join((var.instructions or var.name).split())  # no line breaks in definitions
+        schema[state_field(var.id)] = {"type": var.extract_type or "text", "definition": definition}
+    return schema
+
+
+def map_state(response: dict[str, Any], variables: list[StateVariable]) -> dict[int, tuple[Any, float | None]]:
+    """{variable id: (value, probability)} for every field in the response."""
+    values = response.get("values") or {}
+    results = response.get("results") or {}
+    out: dict[int, tuple[Any, float | None]] = {}
+    for var in variables:
+        field = state_field(var.id)
+        if field not in values:
+            continue
+        result = results.get(field) if isinstance(results.get(field), dict) else {}
+        out[var.id] = (values[field], result.get("probability"))
+    return out
 
 
 def map_location(response: dict[str, Any]) -> str | None:

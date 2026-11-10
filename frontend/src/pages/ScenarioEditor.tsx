@@ -1,24 +1,43 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { api, type Character, type LoreEntry, type Persona, type Scenario } from '../api'
+import {
+  api,
+  type Assignment,
+  type Character,
+  type ChoiceOption,
+  type Competency,
+  type LoreEntry,
+  type Persona,
+  type Profile,
+  type RubricLevel,
+  type Scenario,
+  type ScenarioCompetency,
+  type StateKind,
+  type StateVariable,
+} from '../api'
 import { CheckField, ListField, NumberField, SelectField, TextField } from '../components/Field'
+import { LevelsEditor, OptionsEditor } from '../components/Rubric'
 import { useConfirm } from '../confirm'
 import { useI18n, type MessageKey } from '../i18n'
+import { useProfile } from '../profile'
+import { startTraining } from '../training'
 
 /**
- * World building is a guided flow: the user follows the steps in order, but can jump to any step.
- * Required steps feed the review checklist; optional steps never block play.
+ * Scenario building is a guided flow: the manager follows the steps in order, but can jump to any step.
+ * Required steps feed the review checklist; optional steps never block a test run.
  */
-type StepId = 'premise' | 'characters' | 'persona' | 'lore' | 'opening' | 'tuning' | 'review'
+type StepId = 'premise' | 'characters' | 'persona' | 'competencies' | 'states' | 'lore' | 'opening' | 'tuning' | 'review'
 
 const STEPS: { id: StepId; title: MessageKey; guide: MessageKey; optional?: boolean }[] = [
-  { id: 'premise', title: 'Premise', guide: 'Start with the world. Describe the place, the time and the situation at the start of the story. Then choose the themes: they tell the narrator which genres and tones to keep. The narrator reads this text on every turn.' },
-  { id: 'characters', title: 'Characters', guide: 'Add the characters that the narrator plays. Give each character a description. A personality and a speech style make the voice more consistent. Your own character goes in the next step.' },
-  { id: 'persona', title: 'Your character', guide: "Create the character that you play in this roleplay. You can create more than one and choose one when you start a session. The narrator never writes your character's actions, words or thoughts." },
-  { id: 'lore', title: 'Lorebook', optional: true, guide: 'Add places, factions, items and secrets. An entry goes into the prompt only when one of its keys appears in the chat, or on every turn when it is constant. Location entries let the harness track the current scene.' },
-  { id: 'opening', title: 'Opening', guide: 'Write the first message of the story and the rules for this scenario. The rules are added after the global rules.' },
+  { id: 'premise', title: 'Situation', guide: 'Describe the work situation: the company, the place and what is happening when the simulation starts. Then choose the context tags: they tell the simulation which context and difficulty to keep. The simulation reads this text on every turn.' },
+  { id: 'characters', title: 'Counterparts', guide: 'Add the people that the simulation plays: customers, colleagues, managers. Give each one a description with their goals and limits. A personality and a speech style make the behaviour more realistic.' },
+  { id: 'persona', title: 'Trainee role', guide: "Describe the role that the trainee plays (for example: customer service agent). The simulation never writes the trainee's actions or words." },
+  { id: 'competencies', title: 'Competencies', guide: 'Choose the competencies from the library that this scenario trains. Sage scores every trainee message on their rubrics. A higher weight counts more in the overall score.' },
+  { id: 'states', title: 'States and objectives', optional: true, guide: 'Sage tracks these variables on every turn, for example the trust of the customer. An objective is a yes/no goal of the trainee; once reached, it stays reached. Visible variables shape how the counterparts behave; hidden ones only go to the report.' },
+  { id: 'lore', title: 'Knowledge base', optional: true, guide: 'Add policies, products, prices and facts. An entry goes into the prompt only when one of its keys appears in the chat, or on every turn when it is constant.' },
+  { id: 'opening', title: 'Briefing and opening', guide: 'Write the briefing that the trainee reads before the simulation, the first message of the counterpart and the rules for this scenario. The rules are added after the global rules.' },
   { id: 'tuning', title: 'Fine-tuning', optional: true, guide: 'Change these settings only when the global prompt does not fit this scenario. Empty fields use the global values.' },
-  { id: 'review', title: 'Review and play', guide: 'Check the list. Then choose your character and start a session.' },
+  { id: 'review', title: 'Review and assign', guide: 'Check the list. Test the simulation yourself, then assign it to trainees.' },
 ]
 const isStepId = (value: string | null): value is StepId => STEPS.some((s) => s.id === value)
 
@@ -38,9 +57,18 @@ const LOGIC = [
 const KINDS = ['location', 'faction', 'item', 'concept', 'character', 'other'] as const satisfies readonly MessageKey[]
 const isKnownKind = (kind: string): kind is (typeof KINDS)[number] => (KINDS as readonly string[]).includes(kind)
 
+const STATE_KINDS: { value: StateKind; label: MessageKey }[] = [
+  { value: 'scale', label: 'scale (levels)' },
+  { value: 'choice', label: 'choice (options)' },
+  { value: 'yesno', label: 'yes / no' },
+  { value: 'extract', label: 'value from the text (Extract)' },
+]
+const EXTRACT_TYPES = ['text', 'integer', 'decimal', 'money', 'date', 'time', 'duration']
+const MANY_COMPETENCIES = 8
+
 const THEME_SUGGESTIONS = [
-  'Fantasy', 'Science fiction', 'Horror', 'Mystery', 'Romance', 'Adventure', 'Drama', 'Comedy',
-  'Noir', 'Political intrigue', 'Survival', 'Historical', 'Post-apocalyptic', 'Slice of life',
+  'Customer service', 'Sales', 'Negotiation', 'Leadership', 'Feedback conversation', 'Conflict',
+  'Onboarding', 'Easy', 'Medium difficulty', 'Hard',
 ] as const satisfies readonly MessageKey[]
 
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
@@ -65,14 +93,24 @@ function useSaver() {
   return { run, label, error }
 }
 
+interface Entities {
+  characters: Character[]
+  personas: Persona[]
+  lore: LoreEntry[]
+  links: ScenarioCompetency[]
+  variables: StateVariable[]
+}
+
 /** Which steps are complete. Optional steps count as complete when they have content. */
-function stepStatus(draft: Scenario, characters: Character[], personas: Persona[], lore: LoreEntry[]): Record<StepId, boolean> {
+function stepStatus(draft: Scenario, e: Entities): Record<StepId, boolean> {
   return {
     premise: Boolean(draft.title.trim() && draft.world.trim()),
-    characters: characters.some((c) => c.name.trim() && c.description.trim()),
-    persona: personas.some((p) => p.name.trim()),
-    lore: lore.length > 0,
-    opening: Boolean(draft.opening_message.trim() || characters.some((c) => c.first_message.trim())),
+    characters: e.characters.some((c) => c.name.trim() && c.description.trim()),
+    persona: e.personas.some((p) => p.name.trim()),
+    competencies: e.links.length > 0,
+    states: e.variables.length > 0,
+    lore: e.lore.length > 0,
+    opening: Boolean(draft.briefing.trim() && (draft.opening_message.trim() || e.characters.some((c) => c.first_message.trim()))),
     tuning: Boolean(
       draft.model.trim() || draft.main_prompt_override.trim() || draft.post_history_override.trim() || draft.authors_note.trim() ||
         draft.authors_note_depth != null || draft.authors_note_frequency != null,
@@ -88,13 +126,13 @@ function PremiseStep({ draft, set }: { draft: Scenario; set: SetField }) {
   return (
     <div className="stack">
       <TextField label={t('Title')} value={draft.title} onChange={(v) => set('title', v)} />
-      <TextField label={t('Short summary (library card)')} value={draft.summary} onChange={(v) => set('summary', v)} />
+      <TextField label={t('Short summary (scenario card)')} value={draft.summary} onChange={(v) => set('summary', v)} />
       <TextField
-        label={t('World and situation → <scenario>')}
+        label={t('Work situation → <scenario>')}
         multiline
         rows={10}
         value={draft.world}
-        placeholder={t('Example: A port city in 1720. Pirates control the harbor. The governor has just been murdered…')}
+        placeholder={t('Example: You work in the customer service chat of an online shop. A customer received a broken product for the second time…')}
         onChange={(v) => set('world', v)}
       />
       <ThemesField themes={draft.themes} onChange={(v) => set('themes', v)} />
@@ -109,12 +147,12 @@ function ThemesField({ themes, onChange }: { themes: string[]; onChange: (themes
   return (
     <div className="stack" style={{ gap: 6 }}>
       <ListField
-        label={t('Themes → <themes> (comma-separated genres and tones)')}
+        label={t('Context tags → <themes> (comma-separated)')}
         value={themes}
         onChange={onChange}
-        hint={t('Example: dark fantasy, political intrigue, slow-burn romance')}
+        hint={t('Example: customer service, medium difficulty')}
       />
-      <div className="chips" aria-label={t('Suggested themes')}>
+      <div className="chips" aria-label={t('Suggested tags')}>
         {THEME_SUGGESTIONS.map((key) => {
           const label = t(key)
           return (
@@ -134,6 +172,17 @@ function OpeningStep({ draft, set, characters }: { draft: Scenario; set: SetFiel
   return (
     <div className="stack">
       <TextField
+        label={t('Briefing (the trainee reads it before the simulation)')}
+        multiline
+        rows={6}
+        value={draft.briefing}
+        placeholder={t('Your role, the situation, your objective and the rules that you must follow.')}
+        onChange={(v) => set('briefing', v)}
+      />
+      <div style={{ maxWidth: 240 }}>
+        <NumberField label={t('Turn limit (0 = no limit)')} value={draft.max_turns} min={0} onChange={(v) => set('max_turns', v ?? 0)} />
+      </div>
+      <TextField
         label={t('Opening message (macros allowed: {{user}}, {{char}})')}
         multiline
         rows={6}
@@ -144,7 +193,7 @@ function OpeningStep({ draft, set, characters }: { draft: Scenario; set: SetFiel
             ? undefined
             : fallback
               ? t('Empty: the session starts with the first message of {name}.', { name: fallback.name })
-              : t('Empty, and no character has a first message: the session starts without a narrator message.')
+              : t('Empty, and no counterpart has a first message: the trainee writes first.')
         }
       />
       <TextField
@@ -206,7 +255,7 @@ function CharacterForm({ item: character, onSaved, onDeleted, onDirtyChange }: F
   return (
     <div className="stack">
       <TextField label={t('Name')} value={draft.name} onChange={(v) => set('name', v)} />
-      <TextField label={t('Description')} multiline rows={5} value={draft.description} onChange={(v) => set('description', v)} />
+      <TextField label={t('Description, goals and limits')} multiline rows={5} value={draft.description} onChange={(v) => set('description', v)} />
       <div className="grid2">
         <TextField label={t('Personality')} multiline rows={3} value={draft.personality} onChange={(v) => set('personality', v)} />
         <TextField label={t('Speech style')} multiline rows={3} value={draft.speech_style} onChange={(v) => set('speech_style', v)} />
@@ -311,14 +360,122 @@ function PersonaForm({ item: persona, onSaved, onDeleted, onDirtyChange }: FormP
   useEffect(() => onDirtyChange(dirty), [dirty])
   return (
     <div className="stack">
-      <TextField label={t('Name ({{user}})')} value={draft.name} onChange={(v) => setDraft({ ...draft, name: v })} />
-      <TextField label={t('Description → <persona>')} multiline rows={6} value={draft.description} onChange={(v) => setDraft({ ...draft, description: v })} />
+      <TextField label={t('Role name ({{user}})')} value={draft.name} onChange={(v) => setDraft({ ...draft, name: v })} />
+      <TextField label={t('Role description → <persona>')} multiline rows={6} value={draft.description} onChange={(v) => setDraft({ ...draft, description: v })} />
       <div className="row">
         <button className="primary" disabled={!dirty} onClick={() => saver.run(async () => { await api.patch(`/personas/${persona.id}`, draft); onSaved() })}>{saver.label}</button>
         <button className="danger" onClick={async () => { if (await confirm(t('Delete {name}?', { name: persona.name.trim() || t('(no name)') }), { danger: true, confirmLabel: t('Delete') })) { await api.del(`/personas/${persona.id}`); onDeleted() } }}>{t('Delete')}</button>
         {dirty && <span className="small muted">{t('Unsaved changes')}</span>}
         {saver.error && <span className="error">{saver.error}</span>}
       </div>
+    </div>
+  )
+}
+
+function StateForm({ item, onSaved, onDeleted, onDirtyChange }: FormProps<StateVariable>) {
+  const { t } = useI18n()
+  const confirm = useConfirm()
+  const [draft, setDraft] = useState(item)
+  const saver = useSaver()
+  useEffect(() => setDraft(item), [item])
+  const dirty = !same(draft, item)
+  useEffect(() => onDirtyChange(dirty), [dirty])
+  const set = <K extends keyof StateVariable>(key: K, value: StateVariable[K]) => setDraft({ ...draft, [key]: value })
+  const setKind = (kind: StateKind) =>
+    setDraft({ ...draft, kind, options: [], initial_value: null, is_objective: kind === 'yesno' ? draft.is_objective : false })
+  const initialText = draft.initial_value === null || draft.initial_value === undefined ? '' : String(draft.initial_value)
+  const parseInitial = (v: string) => (v.trim() === '' ? null : draft.kind === 'scale' && !Number.isNaN(Number(v)) ? Number(v) : v)
+  return (
+    <div className="stack">
+      <div className="grid2">
+        <TextField label={t('Name')} value={draft.name} onChange={(v) => set('name', v)} />
+        <SelectField label={t('Kind')} value={draft.kind} options={STATE_KINDS.map((k) => ({ value: k.value, label: t(k.label) }))} onChange={(v) => setKind(v as StateKind)} />
+      </div>
+      <TextField
+        label={draft.kind === 'extract' ? t('What to find in the text (Extract definition)') : t('Question for Sage')}
+        multiline
+        rows={2}
+        value={draft.instructions}
+        placeholder={draft.kind === 'extract' ? t('Example: the discount percentage that the trainee offers') : t('Example: How much does the customer trust the company now, after the LAST message?')}
+        onChange={(v) => set('instructions', v)}
+      />
+      {draft.kind === 'scale' && <LevelsEditor levels={draft.options as RubricLevel[]} onChange={(v) => set('options', v)} />}
+      {draft.kind === 'choice' && <OptionsEditor options={draft.options as ChoiceOption[]} onChange={(v) => set('options', v)} />}
+      {draft.kind === 'extract' && (
+        <SelectField label={t('Value type')} value={draft.extract_type} options={EXTRACT_TYPES} onChange={(v) => set('extract_type', v)} />
+      )}
+      {draft.kind === 'yesno' ? (
+        <CheckField label={t('Objective of the trainee (once reached, it stays reached)')} checked={draft.is_objective} onChange={(v) => set('is_objective', v)} />
+      ) : (
+        <TextField label={t('Initial value (optional)')} value={initialText} onChange={(v) => set('initial_value', parseInitial(v))} />
+      )}
+      <div className="row">
+        <CheckField label={t('Visible to the counterparts (<sim_state>)')} checked={draft.tell_narrator} onChange={(v) => set('tell_narrator', v)} />
+        <CheckField label={t('Enabled')} checked={draft.enabled} onChange={(v) => set('enabled', v)} />
+      </div>
+      <div className="row">
+        <button className="primary" disabled={!dirty} onClick={() => saver.run(async () => { await api.patch(`/state-variables/${item.id}`, draft); onSaved() })}>{saver.label}</button>
+        <button className="danger" onClick={async () => { if (await confirm(t('Delete "{name}"?', { name: item.name.trim() || t('(no name)') }), { danger: true, confirmLabel: t('Delete') })) { await api.del(`/state-variables/${item.id}`); onDeleted() } }}>{t('Delete')}</button>
+        {dirty && <span className="small muted">{t('Unsaved changes')}</span>}
+        {saver.error && <span className="error">{saver.error}</span>}
+      </div>
+    </div>
+  )
+}
+
+function CompetencyLinkForm({ link, onSave }: { link: ScenarioCompetency; onSave: (data: Partial<ScenarioCompetency>) => void }) {
+  const { t } = useI18n()
+  const [weight, setWeight] = useState<number | null>(link.weight)
+  const [focus, setFocus] = useState(link.focus)
+  const dirty = weight !== link.weight || focus !== link.focus
+  return (
+    <div className="row" style={{ alignItems: 'flex-end' }}>
+      <div style={{ width: 110 }}><NumberField label={t('Weight')} value={weight} min={0.1} step={0.5} onChange={setWeight} /></div>
+      <label className="field" style={{ flex: 1, minWidth: 220 }}>
+        {t('What good looks like in this scenario (optional, Sage reads it)')}
+        <input value={focus} onChange={(e) => setFocus(e.target.value)} />
+      </label>
+      <button disabled={!dirty || !weight} onClick={() => onSave({ weight: weight ?? 1, focus })}>{t('Save')}</button>
+    </div>
+  )
+}
+
+function CompetenciesStep({ scenarioId, library, links, onChange }: {
+  scenarioId: number
+  library: Competency[]
+  links: ScenarioCompetency[]
+  onChange: () => void
+}) {
+  const { t } = useI18n()
+  const [error, setError] = useState('')
+  const run = async (fn: () => Promise<unknown>) => {
+    setError('')
+    try {
+      await fn()
+      onChange()
+    } catch (e) {
+      setError(String(e))
+    }
+  }
+  const toggle = (c: Competency, link: ScenarioCompetency | undefined) =>
+    run(() => (link ? api.del(`/scenario-competencies/${link.id}`) : api.post('/scenario-competencies', { scenario_id: scenarioId, competency_id: c.id, order: links.length })))
+  return (
+    <div className="stack">
+      {library.length === 0 && <p className="muted">{t('The competency library is empty. Add competencies on the Competencies page.')}</p>}
+      {links.length > MANY_COMPETENCIES && <p className="warn-text small">{t('Many competencies make each turn slower and more expensive, and the feedback less focused.')}</p>}
+      {error && <div className="error">{error}</div>}
+      {library.map((c) => {
+        const link = links.find((l) => l.competency_id === c.id)
+        return (
+          <div key={c.id} className="card stack" style={{ gap: 8, opacity: c.enabled ? 1 : 0.5 }}>
+            <div className="row">
+              <CheckField label={c.name} checked={Boolean(link)} onChange={() => toggle(c, link)} />
+              <span className="small muted" style={{ flex: 1 }}>{c.description}</span>
+            </div>
+            {link && <CompetencyLinkForm key={link.id} link={link} onSave={(data) => run(() => api.patch(`/scenario-competencies/${link.id}`, data))} />}
+          </div>
+        )
+      })}
     </div>
   )
 }
@@ -345,23 +502,39 @@ function Stepper({ step, done, onSelect }: { step: StepId; done: Record<StepId, 
   )
 }
 
-function ReviewStep({ done, characters, personas, lore, onGo, onPlay }: {
+function ReviewStep({ scenarioId, done, entities, onGo, onTest }: {
+  scenarioId: number
   done: Record<StepId, boolean>
-  characters: Character[]
-  personas: Persona[]
-  lore: LoreEntry[]
+  entities: Entities
   onGo: (id: StepId) => void
-  onPlay: (personaId: number | null) => void
+  onTest: (personaId: number | null) => void
 }) {
   const { t } = useI18n()
+  const { characters, personas, lore, links, variables } = entities
   const [picked, setPicked] = useState<number | null>(null)
+  const [trainees, setTrainees] = useState<Profile[]>([])
+  const [assignments, setAssignments] = useState<Assignment[]>([])
+  const loadAssignments = async () => setAssignments(await api.get<Assignment[]>(`/assignments?scenario_id=${scenarioId}`))
+  useEffect(() => {
+    api.get<Profile[]>('/profiles').then((p) => setTrainees(p.filter((x) => x.role === 'user')))
+    loadAssignments()
+  }, [scenarioId])
+  const toggleAssignment = async (profile: Profile) => {
+    const current = assignments.find((a) => a.profile_id === profile.id)
+    if (current) await api.del(`/assignments/${current.id}`)
+    else await api.post('/assignments', { scenario_id: scenarioId, profile_id: profile.id })
+    loadAssignments()
+  }
   const personaId = personas.some((p) => p.id === picked) ? picked : (personas[0]?.id ?? null)
+  const objectives = variables.filter((v) => v.is_objective).length
   const rows: { id: StepId; ok: boolean; optional?: boolean; text: string }[] = [
-    { id: 'premise', ok: done.premise, text: t('The world has a title and a description.') },
-    { id: 'characters', ok: done.characters, text: t('At least one character has a name and a description ({n} characters).', { n: characters.length }) },
-    { id: 'persona', ok: done.persona, text: t('You have a character to play ({n} characters).', { n: personas.length }) },
-    { id: 'lore', ok: done.lore, optional: true, text: t('{n} lore entries.', { n: lore.length }) },
-    { id: 'opening', ok: done.opening, text: t('The story has an opening message.') },
+    { id: 'premise', ok: done.premise, text: t('The situation has a title and a description.') },
+    { id: 'characters', ok: done.characters, text: t('At least one counterpart has a name and a description ({n} counterparts).', { n: characters.length }) },
+    { id: 'persona', ok: done.persona, text: t('The trainee has a role ({n} roles).', { n: personas.length }) },
+    { id: 'competencies', ok: done.competencies, text: t('{n} competencies are evaluated.', { n: links.length }) },
+    { id: 'states', ok: done.states, optional: true, text: t('{n} state variables, {m} objectives.', { n: variables.length, m: objectives }) },
+    { id: 'lore', ok: done.lore, optional: true, text: t('{n} knowledge entries.', { n: lore.length }) },
+    { id: 'opening', ok: done.opening, text: t('The trainee has a briefing, and the simulation has an opening.') },
     { id: 'tuning', ok: done.tuning, optional: true, text: done.tuning ? t('Changes some global prompt settings.') : t('Uses the global prompt settings.') },
   ]
   const ready = rows.every((r) => r.ok || r.optional)
@@ -377,19 +550,29 @@ function ReviewStep({ done, characters, personas, lore, onGo, onPlay }: {
         ))}
       </ul>
       <p className={ready ? 'ok-text' : 'warn-text'}>
-        {ready ? t('Everything is ready.') : t('Some required steps are not complete. You can play, but the story can be weak.')}
+        {ready ? t('Everything is ready.') : t('Some required steps are not complete. You can test, but the simulation or the evaluation can be weak.')}
       </p>
       <div className="row" style={{ alignItems: 'flex-end' }}>
-        <label className="field" style={{ width: 240 }}>
-          {t('Play as')}
-          <select value={personaId ?? ''} onChange={(e) => setPicked(e.target.value ? Number(e.target.value) : null)}>
-            {personas.length === 0 && <option value="">{t('No character')}</option>}
-            {personas.map((p) => (
-              <option key={p.id} value={p.id}>{p.name.trim() || t('(no name)')}</option>
-            ))}
-          </select>
-        </label>
-        <button className="primary" onClick={() => onPlay(personaId)}>{t('Start session')}</button>
+        {personas.length > 1 && (
+          <label className="field" style={{ width: 240 }}>
+            {t('Trainee role')}
+            <select value={personaId ?? ''} onChange={(e) => setPicked(e.target.value ? Number(e.target.value) : null)}>
+              {personas.map((p) => (
+                <option key={p.id} value={p.id}>{p.name.trim() || t('(no name)')}</option>
+              ))}
+            </select>
+          </label>
+        )}
+        <button className="primary" onClick={() => onTest(personaId)}>{t('Test the simulation')}</button>
+      </div>
+      <div className="card stack" style={{ gap: 6 }}>
+        <h3>{t('Assigned to')}</h3>
+        {trainees.length === 0 && <p className="small muted">{t('No trainees yet. Add people on the Team page.')}</p>}
+        <div className="row">
+          {trainees.map((p) => (
+            <CheckField key={p.id} label={p.name} checked={assignments.some((a) => a.profile_id === p.id)} onChange={() => toggleAssignment(p)} />
+          ))}
+        </div>
       </div>
     </div>
   )
@@ -398,42 +581,45 @@ function ReviewStep({ done, characters, personas, lore, onGo, onPlay }: {
 export default function ScenarioEditor() {
   const { t } = useI18n()
   const confirm = useConfirm()
+  const { profile } = useProfile()
   const { id } = useParams()
   const scenarioId = Number(id)
   const navigate = useNavigate()
   const [params, setParams] = useSearchParams()
   const [scenario, setScenario] = useState<Scenario | null>(null)
   const [draft, setDraft] = useState<Scenario | null>(null)
-  const [characters, setCharacters] = useState<Character[]>([])
-  const [personas, setPersonas] = useState<Persona[]>([])
-  const [lore, setLore] = useState<LoreEntry[]>([])
+  const [entities, setEntities] = useState<Entities>({ characters: [], personas: [], lore: [], links: [], variables: [] })
+  const [library, setLibrary] = useState<Competency[]>([])
   const [selected, setSelected] = useState<number | null>(null)
   const [error, setError] = useState('')
   const formDirty = useRef(false)
   const saver = useSaver()
 
-  const loadEntities = async () => {
-    const [c, p, l] = await Promise.all([
+  const loadEntities = async (): Promise<Entities> => {
+    const [characters, personas, lore, links, variables, lib] = await Promise.all([
       api.get<Character[]>(`/characters?scenario_id=${scenarioId}`),
       api.get<Persona[]>(`/personas?scenario_id=${scenarioId}`),
       api.get<LoreEntry[]>(`/lore?scenario_id=${scenarioId}`),
+      api.get<ScenarioCompetency[]>(`/scenario-competencies?scenario_id=${scenarioId}`),
+      api.get<StateVariable[]>(`/state-variables?scenario_id=${scenarioId}`),
+      api.get<Competency[]>('/competencies'),
     ])
-    setCharacters(c)
-    setPersonas(p)
-    setLore(l)
-    return { c, p, l }
+    const next = { characters, personas, lore, links, variables }
+    setEntities(next)
+    setLibrary(lib)
+    return next
   }
 
   useEffect(() => {
     ;(async () => {
       try {
         const s = await api.get<Scenario>(`/scenarios/${scenarioId}`)
-        const { c, p, l } = await loadEntities()
+        const loaded = await loadEntities()
         setScenario(s)
         setDraft(s)
         if (!isStepId(params.get('step'))) {
           // Open the first required step that is not complete, or the review when all are complete.
-          const done = stepStatus(s, c, p, l)
+          const done = stepStatus(s, loaded)
           const first = STEPS.find((st) => !st.optional && st.id !== 'review' && !done[st.id])
           setParams({ step: first?.id ?? 'review' }, { replace: true })
         }
@@ -455,11 +641,12 @@ export default function ScenarioEditor() {
   if (error) return <div className="page error">{error}</div>
   if (!scenario || !draft) return <div className="page muted">{t('Loading…')}</div>
 
+  const { characters, personas, lore, variables } = entities
   const stepParam = params.get('step')
   const step: StepId = isStepId(stepParam) ? stepParam : 'premise'
   const index = STEPS.findIndex((s) => s.id === step)
   const meta = STEPS[index]
-  const done = stepStatus(draft, characters, personas, lore)
+  const done = stepStatus(draft, entities)
 
   const set: SetField = (key, value) => setDraft({ ...draft, [key]: value })
   const saveScenario = () =>
@@ -478,7 +665,7 @@ export default function ScenarioEditor() {
     return true
   }
 
-  /** Leaving a step saves the scenario fields and asks before it drops an unsaved character or lore form. */
+  /** Leaving a step saves the scenario fields and asks before it drops an unsaved form. */
   const goTo = async (next: StepId) => {
     if (next === step || !(await confirmDiscard())) return
     if (!(await saveScenario())) return
@@ -492,33 +679,26 @@ export default function ScenarioEditor() {
   }
 
   const startSession = async (personaId: number | null) => {
-    if (!(await confirmDiscard()) || !(await saveScenario())) return
+    if (!profile || !(await confirmDiscard()) || !(await saveScenario())) return
     try {
-      const session = await api.post<{ id: number }>('/sessions', { scenario_id: scenarioId, persona_id: personaId })
+      const session = await startTraining(scenarioId, profile.id, personaId)
       navigate(`/play/${session.id}`)
     } catch (e) {
       setError(String(e))
     }
   }
 
-  const addCharacter = async () => {
+  const add = async (path: string, body: Record<string, unknown>) => {
     if (!(await confirmDiscard())) return
-    const c = await api.post<Character>('/characters', { scenario_id: scenarioId, name: t('New character') })
+    const item = await api.post<{ id: number }>(path, { scenario_id: scenarioId, ...body })
     await loadEntities()
-    setSelected(c.id)
+    setSelected(item.id)
   }
-  const addPersona = async () => {
-    if (!(await confirmDiscard())) return
-    const p = await api.post<Persona>('/personas', { scenario_id: scenarioId, name: t('New character') })
-    await loadEntities()
-    setSelected(p.id)
-  }
-  const addLore = async () => {
-    if (!(await confirmDiscard())) return
-    const l = await api.post<LoreEntry>('/lore', { scenario_id: scenarioId, title: t('New entry') })
-    await loadEntities()
-    setSelected(l.id)
-  }
+  const addItem = () =>
+    step === 'characters' ? add('/characters', { name: t('New counterpart') })
+      : step === 'persona' ? add('/personas', { name: t('New role') })
+        : step === 'states' ? add('/state-variables', { name: t('New variable'), kind: 'yesno', order: variables.length })
+          : add('/lore', { title: t('New entry') })
   const afterDelete = () => {
     formDirty.current = false
     setSelected(null)
@@ -526,17 +706,21 @@ export default function ScenarioEditor() {
   }
   const onDirtyChange = (dirty: boolean) => { formDirty.current = dirty }
 
-  const items: (Character | Persona | LoreEntry)[] = step === 'characters' ? characters : step === 'persona' ? personas : step === 'lore' ? lore : []
+  const listSteps: StepId[] = ['characters', 'persona', 'lore', 'states']
+  const items: (Character | Persona | LoreEntry | StateVariable)[] =
+    step === 'characters' ? characters : step === 'persona' ? personas : step === 'lore' ? lore : step === 'states' ? variables : []
   const current = items.find((i) => i.id === selected) ?? items[0]
   const editsScenario = step === 'premise' || step === 'opening' || step === 'tuning'
   const prev = STEPS[index - 1]
   const next = STEPS[index + 1]
+  const addLabel = step === 'lore' ? t('+ Add entry') : step === 'states' ? t('+ Add variable') : step === 'persona' ? t('+ Add role') : t('+ Add counterpart')
+  const emptyText = step === 'lore' ? t('No knowledge entries yet. You can skip this step.') : step === 'states' ? t('No variables yet. You can skip this step.') : t('Nothing here yet. Add the first one.')
 
   return (
     <div className="page">
       <div className="page-narrow">
         <div className="row" style={{ marginBottom: 14 }}>
-          <button className="ghost" onClick={async () => { if ((await confirmDiscard()) && (await saveScenario())) navigate('/') }}>← {t('Library')}</button>
+          <button className="ghost" onClick={async () => { if ((await confirmDiscard()) && (await saveScenario())) navigate('/') }}>← {t('Scenarios')}</button>
           <h1 style={{ margin: 0 }}>{draft.title || t('Untitled scenario')}</h1>
         </div>
 
@@ -552,14 +736,13 @@ export default function ScenarioEditor() {
           {step === 'premise' && <PremiseStep draft={draft} set={set} />}
           {step === 'opening' && <OpeningStep draft={draft} set={set} characters={characters} />}
           {step === 'tuning' && <TuningStep draft={draft} set={set} />}
-          {step === 'review' && <ReviewStep done={done} characters={characters} personas={personas} lore={lore} onGo={goTo} onPlay={startSession} />}
+          {step === 'competencies' && <CompetenciesStep scenarioId={scenarioId} library={library} links={entities.links} onChange={loadEntities} />}
+          {step === 'review' && <ReviewStep scenarioId={scenarioId} done={done} entities={entities} onGo={goTo} onTest={startSession} />}
 
-          {(step === 'characters' || step === 'persona' || step === 'lore') && (
+          {listSteps.includes(step) && (
             <div className="split">
               <div className="stack" style={{ gap: 6 }}>
-                <button onClick={step === 'characters' ? addCharacter : step === 'persona' ? addPersona : addLore}>
-                  {step === 'lore' ? t('+ Add entry') : t('+ Add character')}
-                </button>
+                <button onClick={addItem}>{addLabel}</button>
                 {step === 'characters' &&
                   characters.map((c) => (
                     <button key={c.id} className={`list-item ${current?.id === c.id ? 'selected' : ''}`} onClick={() => select(c.id)}>
@@ -583,9 +766,17 @@ export default function ScenarioEditor() {
                       <span className="badge">{isKnownKind(l.kind) ? t(l.kind) : l.kind}</span>
                     </button>
                   ))}
+                {step === 'states' &&
+                  variables.map((v) => (
+                    <button key={v.id} className={`list-item ${current?.id === v.id ? 'selected' : ''}`} style={{ opacity: v.enabled ? 1 : 0.5 }} onClick={() => select(v.id)}>
+                      <span style={{ flex: 1 }}>{v.name.trim() || <em className="muted">{t('(no name)')}</em>}</span>
+                      {v.is_objective && <span className="badge accent">{t('objective')}</span>}
+                      {!v.tell_narrator && <span className="badge">{t('hidden')}</span>}
+                    </button>
+                  ))}
               </div>
               <div className="card">
-                {!current && <p className="muted">{step === 'lore' ? t('No lore entries yet. You can skip this step.') : t('No characters yet. Add the first character.')}</p>}
+                {!current && <p className="muted">{emptyText}</p>}
                 {current && step === 'characters' && (
                   <CharacterForm key={current.id} item={current as Character} onSaved={loadEntities} onDeleted={afterDelete} onDirtyChange={onDirtyChange} />
                 )}
@@ -594,6 +785,9 @@ export default function ScenarioEditor() {
                 )}
                 {current && step === 'lore' && (
                   <LoreForm key={current.id} item={current as LoreEntry} characters={characters} onSaved={loadEntities} onDeleted={afterDelete} onDirtyChange={onDirtyChange} />
+                )}
+                {current && step === 'states' && (
+                  <StateForm key={current.id} item={current as StateVariable} onSaved={loadEntities} onDeleted={afterDelete} onDirtyChange={onDirtyChange} />
                 )}
               </div>
             </div>

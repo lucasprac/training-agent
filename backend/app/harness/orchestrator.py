@@ -3,11 +3,12 @@
 This is the only module that uses both `app.sage` and `app.prompt`.
 """
 
+import asyncio
 import logging
 import random
 import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from sqlalchemy import Engine
@@ -18,16 +19,27 @@ from app.clients.sage import SageClient, SageError
 from app.config import Settings
 from app.harness import summarizer
 from app.harness.state import HarnessState
+from app.sage.evaluation import (
+    ScenarioCompetencyItem,
+    build_evaluation,
+    evaluation_view,
+    sentence_spans,
+    to_evaluations,
+)
+from app.training import state as sim_state
+from app.training.competencies import scenario_competencies
 from app.models import (
     Character,
+    Evaluation,
     GlobalRule,
     LoreEntry,
     MemoryItem,
     Message,
     Persona,
     PromptPreset,
-    RoleplaySession,
+    TrainingSession,
     Scenario,
+    StateVariable,
     TurnTrace,
 )
 from app.prompt.assembler import AssemblyInput, AssemblyOutput, AuthorsNote, assemble
@@ -38,11 +50,14 @@ from app.sage.extract import (
     candidate_sentences,
     location_schema,
     map_location,
+    map_state,
+    state_schema,
     subjects_in,
 )
-from app.sage.registry import BY_KEY, ELSEWHERE, SageContext
+from app.sage.registry import BY_KEY, ELSEWHERE, SageContext, state_specs
 from app.sage.request import (
     POST_TURN_VIEW_TOKENS,
+    SIMULATION_SPEAKER,
     build_post_turn,
     build_pre_turn,
     build_sage_view,
@@ -60,17 +75,22 @@ log = logging.getLogger(__name__)
 
 MAX_MEMORY_POOL = 120
 DEGRADED_MEMORY_COUNT = 15
+EXTRACT_VIEW_TOKENS = 2000  # state Extract reads the last exchange only
+
+
+async def _nothing() -> None:
+    return None
 
 GUIDANCE_CAUTION = "Caution: keep this reply within the global and scenario rules."
 PACING_NOTES = {
-    3: "Pacing: the scene is stalling. Introduce a complication, a new arrival or a consequence.",
-    2: "Pacing: keep momentum. Let the characters act on their own goals.",
+    3: "Pacing: the conversation is stalling. Let a counterpart move it forward: raise a new concern, ask for a decision or add realistic pressure.",
+    2: "Pacing: keep momentum. Let the counterparts act on their own goals.",
 }
 
 
 @dataclass
 class TurnContext:
-    session: RoleplaySession
+    session: TrainingSession
     scenario: Scenario
     characters: list[Character]
     persona: Persona | None
@@ -79,6 +99,8 @@ class TurnContext:
     lore: list[LoreEntry]
     memory: list[MemoryItem]
     messages: list[Message]  # all non-blocked messages, chronological
+    state_variables: list[StateVariable] = field(default_factory=list)  # enabled, in order
+    competencies: list[ScenarioCompetencyItem] = field(default_factory=list)
 
     @property
     def persona_name(self) -> str:
@@ -96,7 +118,7 @@ class TurnContext:
 
 
 def load_context(db: Session, session_id: int) -> TurnContext:
-    session = db.get(RoleplaySession, session_id)
+    session = db.get(TrainingSession, session_id)
     if session is None:
         raise LookupError(f"session {session_id} not found")
     scenario = db.get(Scenario, session.scenario_id)
@@ -121,6 +143,8 @@ def load_context(db: Session, session_id: int) -> TurnContext:
                 .order_by(Message.turn_index, Message.id)
             )
         ),
+        state_variables=sim_state.active(list(db.exec(select(StateVariable).where(StateVariable.scenario_id == scenario.id)))),
+        competencies=scenario_competencies(db, scenario.id),
     )
 
 
@@ -145,10 +169,26 @@ def authors_note_for(ctx: TurnContext) -> AuthorsNote:
     return AuthorsNote(text=text or "", position=p.authors_note_position, depth=depth, frequency=freq)
 
 
-def initial_labels(characters: list[Character]) -> L.LabelSet:
+def initial_labels(characters: list[Character], variables: list[StateVariable] | None = None) -> L.LabelSet:
     labels = L.LabelSet()
     labels.put(L.Label(key="scene.present", value=[c.id for c in characters], certainty="low", source="default"))
+    sim_state.put_initial(labels, variables or [])
     return labels
+
+
+def reached_objectives(labels: L.LabelSet, variables: list[StateVariable]) -> set[str]:
+    """Objectives already reached: they are not asked again."""
+    return {sim_state.state_key(v.id) for v in variables if v.is_objective and labels.value(sim_state.state_key(v.id)) is True}
+
+
+def end_reason(ctx: TurnContext, labels: L.LabelSet, turn: int) -> str | None:
+    """Why the trainee should end the simulation now: "max_turns", "objectives", or None."""
+    if ctx.scenario.max_turns and turn >= ctx.scenario.max_turns:
+        return "max_turns"
+    objectives = [v for v in ctx.state_variables if v.is_objective]
+    if objectives and len(reached_objectives(labels, objectives)) == len(objectives):
+        return "objectives"
+    return None
 
 
 class Harness:
@@ -172,7 +212,7 @@ class Harness:
         """`history` ends with the new user message."""
         session, preset = ctx.session, ctx.preset
         turn = history[-1].turn_index
-        labels = L.LabelSet.from_json(session.labels) if session.labels else initial_labels(ctx.characters)
+        labels = L.LabelSet.from_json(session.labels) if session.labels else initial_labels(ctx.characters, ctx.state_variables)
         state = HarnessState(labels=labels)
         texts = [m.content for m in history]
         previous_location = labels.value("scene.location")
@@ -190,24 +230,44 @@ class Harness:
             memory_pool=memory_pool,
             present_ids=present_before,
         )
-        view = build_sage_view(ctx.rules, ctx.scenario.scenario_rules, labels, ctx.characters, ctx.persona_name, history)
-        built = build_pre_turn(view, sage_ctx, labels.locked_keys())
+        view = build_sage_view(
+            ctx.rules, ctx.scenario.scenario_rules, labels, ctx.characters, ctx.persona_name, history,
+            state_lines=sim_state.state_lines(ctx.state_variables, labels, narrator_only=False),
+        )
+        skip = labels.locked_keys() | reached_objectives(labels, ctx.state_variables)
+        extra_specs = state_specs(ctx.state_variables)
+        built = build_pre_turn(view, sage_ctx, skip, extra_specs)
+        extract_vars = [v for v in ctx.state_variables if v.kind == "extract" and sim_state.state_key(v.id) not in skip]
         answers: dict[str, L.Answer] = {}
-        state.sage = {"questions": built.question_count}
+        extracted: dict[int, tuple[Any, float | None]] = {}
+        state.sage = {"questions": built.question_count, "extract_fields": len(extract_vars)}
 
         if not self.sage.configured:
             state.degraded.append("sage_not_configured")
-        elif built.requests:
+        elif built.requests or extract_vars:
             started = time.perf_counter()
-            try:
-                response = await self.sage.decide_batch(built.requests, preset.sage_reasoning)
-                raw, errors = L.parse_batch(response)
+            decide, extract = await asyncio.gather(
+                self.sage.decide_batch(built.requests, preset.sage_reasoning) if built.requests else _nothing(),
+                self.sage.extract(format_chat(history[-2:], ctx.persona_name, EXTRACT_VIEW_TOKENS), state_schema(extract_vars))
+                if extract_vars else _nothing(),
+                return_exceptions=True,
+            )
+            if isinstance(decide, SageError):
+                state.degraded.append(f"sage_pre_turn: {decide}")
+            elif isinstance(decide, BaseException):
+                raise decide
+            elif decide is not None:
+                raw, errors = L.parse_batch(decide)
                 answers = {built.qid_to_key.get(qid, qid): a for qid, a in raw.items()}
-                state.sage["usage"] = (response.get("meta") or {}).get("usage")
+                state.sage["usage"] = (decide.get("meta") or {}).get("usage")
                 if errors:
                     state.sage["errors"] = errors
-            except SageError as exc:
-                state.degraded.append(f"sage_pre_turn: {exc}")
+            if isinstance(extract, SageError):
+                state.sage["extract_error"] = str(extract)
+            elif isinstance(extract, BaseException):
+                raise extract
+            elif extract is not None:
+                extracted = map_state(extract, extract_vars)
             state.sage["latency_ms"] = round((time.perf_counter() - started) * 1000)
 
         if state.degraded:
@@ -221,8 +281,8 @@ class Harness:
             if limits.value is None:
                 state.guidance.append(GUIDANCE_CAUTION)
             loc = L.apply_choice(labels, "scene.location", answers.get("scene.location"), BY_KEY["scene.location"].threshold, turn)
-            L.apply_choice(labels, "scene.type", answers.get("scene.type"), BY_KEY["scene.type"].threshold, turn)
-            L.apply_choice(labels, "scene.mood", answers.get("scene.mood"), BY_KEY["scene.mood"].threshold, turn)
+            L.apply_choice(labels, "scene.stage", answers.get("scene.stage"), BY_KEY["scene.stage"].threshold, turn)
+            L.apply_choice(labels, "scene.tone", answers.get("scene.tone"), BY_KEY["scene.tone"].threshold, turn)
             location_changed = loc.certainty == "high" and loc.value != previous_location and previous_location is not None
             L.apply_present(labels, answers.get("scene.present"), [c.id for c in ctx.characters], turn, location_changed)
             selected_lore = finalize(activation, L.tag_applies(answers.get("select.lore"), "l") or {})
@@ -231,6 +291,14 @@ class Harness:
                 state.memory = memory_pool[:DEGRADED_MEMORY_COUNT] if memory_pool else []
             else:
                 state.memory = [m for m in memory_pool if memory_applies.get(m.id) is not False]
+            objectives = {sim_state.state_key(v.id) for v in ctx.state_variables if v.is_objective}
+            for spec in extra_specs:
+                if spec.key not in skip:
+                    L.apply_state(labels, spec.key, spec.kind, answers.get(spec.key), spec.threshold, turn, spec.key in objectives)
+        # Extract runs apart from Decide, so its values count even when Decide failed.
+        for var in extract_vars:
+            if var.id in extracted:
+                L.apply_extracted(labels, sim_state.state_key(var.id), *extracted[var.id], turn)
 
         if session.pacing_note:
             state.guidance.append(session.pacing_note)
@@ -273,6 +341,7 @@ class Harness:
                 turn=max(history[-1].turn_index, 1) if history else 1,
                 ooc=state.ooc,
                 rng=self.rng,
+                state_variables=ctx.state_variables,
             )
         )
 
@@ -287,6 +356,13 @@ class Harness:
                 ctx = load_context(db, session_id)
             except LookupError as exc:
                 yield {"event": "error", "data": {"message": str(exc)}}
+                return
+            if ctx.session.status == "completed":
+                yield {"event": "error", "data": {"message": "This simulation is completed."}}
+                return
+            max_turns = ctx.scenario.max_turns
+            if not regenerate and max_turns and ctx.session.turn_count >= max_turns:
+                yield {"event": "error", "data": {"message": "The turn limit of this simulation is reached. End the simulation to see the report."}}
                 return
 
             if regenerate:
@@ -396,7 +472,8 @@ class Harness:
             db.commit()
             db.refresh(assistant)
             db.refresh(trace)
-            yield {"event": "done", "data": {"message_id": assistant.id, "user_message_id": user_msg.id, **usage}}
+            done = {"message_id": assistant.id, "user_message_id": user_msg.id, **usage, "end_reason": end_reason(ctx, state.labels, turn)}
+            yield {"event": "done", "data": done}
 
             user_msg_id, assistant_id, trace_id = user_msg.id, assistant.id, trace.id
 
@@ -419,7 +496,7 @@ class Harness:
                     return report
                 labels = L.LabelSet.from_json(ctx.session.labels)
                 present = labels.value("scene.present", [c.id for c in ctx.characters])
-                turn_text = f"{ctx.persona_name}: {user_msg.content}\n\nNarrator: {reply.content}"
+                turn_text = f"{ctx.persona_name}: {user_msg.content}\n\n{SIMULATION_SPEAKER}: {reply.content}"
                 if self.sage.configured:
                     await self._extract_location(labels, turn_text, ctx.persona_name, user_msg.turn_index, report)
                     sentences = candidate_sentences(user_msg.content, reply.content, ctx.persona_name, [m.content for m in ctx.memory])
@@ -427,16 +504,24 @@ class Harness:
                     recent_view = format_chat(ctx.messages[-8:], ctx.persona_name, POST_TURN_VIEW_TOKENS)
                     built = build_post_turn(turn_text, recent_view, sentences, sage_ctx)
                     answers: dict[str, L.Answer] = {}
-                    if built.requests:
-                        try:
-                            response = await self.sage.decide_batch(built.requests)
-                            raw, errors = L.parse_batch(response)
-                            answers = {built.qid_to_key.get(q, q): a for q, a in raw.items()}
-                            report["usage"] = (response.get("meta") or {}).get("usage")
-                            if errors:
-                                report["errors"].append(f"post_turn answers: {errors}")
-                        except SageError as exc:
-                            report["errors"].append(f"post_turn: {exc}")
+                    # Memory + pacing and the competency evaluation run at the same time.
+                    response, evaluated = await asyncio.gather(
+                        self.sage.decide_batch(built.requests) if built.requests else _nothing(),
+                        self._evaluate(db, ctx, user_msg, report),
+                        return_exceptions=True,
+                    )
+                    if isinstance(evaluated, BaseException):
+                        raise evaluated
+                    if isinstance(response, SageError):
+                        report["errors"].append(f"post_turn: {response}")
+                    elif isinstance(response, BaseException):
+                        raise response
+                    elif response is not None:
+                        raw, errors = L.parse_batch(response)
+                        answers = {built.qid_to_key.get(q, q): a for q, a in raw.items()}
+                        report["usage"] = (response.get("meta") or {}).get("usage")
+                        if errors:
+                            report["errors"].append(f"post_turn answers: {errors}")
                     kind_spec = BY_KEY["memory.kind"]
                     all_ids = {c.id for c in ctx.characters}
                     for index, sentence in enumerate(sentences):
@@ -486,6 +571,41 @@ class Harness:
             report["errors"].append(f"post_turn crashed: {exc}")
         return report
 
+    async def _evaluate(self, db: Session, ctx: TurnContext, user_msg: Message, report: dict[str, Any]) -> None:
+        """Sage scores the trainee message on each scenario competency, with evidence sentences.
+        The scores are stored, never shown to the narrator, and only counts go to the stream."""
+        items = ctx.competencies
+        if not items:
+            return
+        earlier = [m for m in ctx.messages if m.turn_index < user_msg.turn_index][-12:]
+        sentences = sentence_spans(user_msg.content)
+        built = build_evaluation(evaluation_view(earlier, user_msg, ctx.persona_name), items, ctx.persona_name, sentences)
+        error: str | None = None
+        answers: dict[str, L.Answer] = {}
+        try:
+            response = await self.sage.decide_batch(built.requests, ctx.preset.evaluation_reasoning)
+            raw, errors = L.parse_batch(response)
+            answers = {built.qid_to_key.get(q, q): a for q, a in raw.items()}
+            report["evaluation_usage"] = (response.get("meta") or {}).get("usage")
+            if errors:
+                report["errors"].append(f"evaluation answers: {errors}")
+        except SageError as exc:
+            error = str(exc)
+
+        # Regenerate evaluates the same message again: replace Sage rows, keep manager corrections.
+        corrected: set[int] = set()
+        for row in db.exec(select(Evaluation).where(Evaluation.message_id == user_msg.id)):
+            if row.source == "manager":
+                corrected.add(row.competency_id)
+            else:
+                db.delete(row)
+        rows = [r for r in to_evaluations(answers, sentences, items, user_msg, error) if r.competency_id not in corrected]
+        db.add_all(rows)
+        db.commit()
+        report["evaluation"] = {"competencies": len(rows), "needs_review": sum(r.needs_review for r in rows)}
+        if error:
+            report["errors"].append(f"evaluation: {error}")
+
     async def _extract_location(self, labels: L.LabelSet, turn_text: str, persona_name: str, turn: int, report: dict[str, Any]) -> None:
         """Sage Extract finds the place name when the scene moved somewhere not in the lorebook."""
         label = labels.get("scene.location")
@@ -529,7 +649,7 @@ class Harness:
             if call_sage:
                 state = await self.pre_turn(ctx, history)
             else:
-                labels = L.LabelSet.from_json(ctx.session.labels) if ctx.session.labels else initial_labels(ctx.characters)
+                labels = L.LabelSet.from_json(ctx.session.labels) if ctx.session.labels else initial_labels(ctx.characters, ctx.state_variables)
                 activation = activate(ctx.lore, [m.content for m in history], draft.turn_index, ctx.session.lore_timers, labels.value("scene.location"), self.rng)
                 kept, dropped = apply_budget(finalize(activation, None), int(ctx.preset.context_size * ctx.preset.lore_budget_pct / 100))
                 memory = rank_memory(ctx.memory, ctx.characters, labels.value("scene.present", []), user_text)[:DEGRADED_MEMORY_COUNT]

@@ -1,11 +1,13 @@
-# Roleplay Harness
+# Training Agent
 
-A local, single-user roleplay platform. It has two parts:
+A simulation environment for competency training. A company (the **manager**) builds work scenarios. Employees (the **trainees**) practise them in a chat simulation. **Levanto Sage 2** tracks the state of each simulation and evaluates every trainee message against the company's competency rubrics, with evidence. At the end, the trainee gets a report; the manager sees the results of the team.
 
-- **Interface** (React + Vite): build scenarios step by step (world and themes, characters, your own character, lorebook), then play.
-- **Harness** (FastAPI): prepares the context, resources and memory for the narrator agent on every turn.
+It has two parts:
 
-The harness is hybrid. **Levanto Sage 2** (Decide + Extract) does the structured work. An **OpenRouter** model writes the story. The prompt follows the **SillyTavern** model (Prompt Manager order, World Info, Author's Note, Post-History Instructions, macros). Every block is a tagged section, so the narrator can tell rules, lore, memory and scene apart.
+- **Interface** (React + Vite): scenario editor, competency library, team and assignments, the simulation, the report and the results table.
+- **Harness** (FastAPI): prepares the context for the simulation model on every turn, asks Sage for the state and the evaluation, and builds the report.
+
+The harness is hybrid. **Sage** (Decide + Extract) does all the structured work: guards, scene, state variables, objectives, competency scores and evidence. An **OpenRouter** model plays the counterparts (customers, colleagues, managers) and writes the final feedback text. The model never sees scores, and it never changes them.
 
 ## Setup
 
@@ -32,52 +34,81 @@ Requirements: Python 3.12 + [uv](https://docs.astral.sh/uv/), Node 22+.
    cd frontend && npm run dev
    ```
 
-4. Open http://localhost:5173. The SQLite database is created at `backend/data/roleplay.db` with a default prompt preset and the global rules. Each scenario has its own personas (the character you play).
+4. Open http://localhost:5173 and choose a profile. The SQLite database is created at `backend/data/training.db` with the global prompt preset, the global rules and a starter competency library (pt-BR). With `SAMPLE_DATA=true` (the default) a new database also gets a manager, a trainee and one ready scenario ("Cliente insatisfeita: entrega com defeito") assigned to the trainee.
 
-Without `SAGE_API_KEY` the platform still works in **degraded mode** (keyword-only lore, no scene labels, no memory extraction). Without `OPENROUTER_API_KEY` no reply can be written.
+**Profiles have no login.** The chosen profile is stored in the browser, and anyone can switch profiles. This is for prototypes and demos only.
+
+Without `SAGE_API_KEY` the simulation still runs in **degraded mode** (keyword-only lore, no state, no evaluation). Without `OPENROUTER_API_KEY` no reply and no written feedback can be produced.
+
+## Roles
+
+| Manager | Trainee |
+|---|---|
+| Builds scenarios (situation, counterparts, trainee role, competencies, states and objectives, knowledge base, briefing) | Sees the trainings assigned to them |
+| Keeps the competency library (indicators and rubric levels) | Reads the briefing and runs the simulation |
+| Assigns scenarios to trainees, with an optional due date | Ends the simulation and reads the report |
+| Tests a scenario with the inspector (harness, state, evaluation, prompt, memory, labels) | Sees scores only in the final report |
+| Reviews evaluations that Sage could not decide, and sees the results table | |
 
 ## How a turn works
 
 ```
-user message
-  → World Info keyword pass (keys, secondary logic, regex, recursion, sticky/cooldown/delay, trigger %)
-  → ONE Sage /decide/batch (pre-turn): guard.ooc, guard.limits, scene.location/type/mood,
-    scene.present, select.lore, select.memory  → typed LabelSet
-  → prompt assembler (SillyTavern order, tagged blocks, veil of knowledge, budget + trimming)
-  → OpenRouter streaming reply  (SSE to the browser)
-  → post-turn: ONE Sage /decide/batch: each sentence of the turn → memory.kind + veil.known_by,
-    plus pacing.stalling; Sage /v1/extract names a new place when the scene left the lorebook map
+trainee message
+  → World Info keyword pass (the scenario knowledge base)
+  → pre-turn, in parallel:
+      Sage /decide/batch: guard.ooc, guard.limits, scene.location/stage/tone, scene.present,
+                          select.lore, select.memory, one question per state variable (state.<id>)
+      Sage /v1/extract:   typed state variables (for example "discount offered" = 15)
+  → prompt assembler (tagged blocks; <sim_state> shows only the variables visible to the counterparts)
+  → OpenRouter streaming reply (SSE to the browser)
+  → post-turn, in parallel:
+      Sage /decide/batch: memory.kind + veil.known_by per sentence, pacing.stalling
+      Sage /decide/batch: competency evaluation of the trainee message (see below)
   → rolling summary (summary model) when the history gets long
 ```
 
-SSE events: `harness` (labels, lore, memory, prompt) → `token`… → `done` → `post_turn` (new memory, pacing). A blocked message ends with `blocked`.
+SSE events: `harness` → `token`… → `done` (with `end_reason`: `objectives` or `max_turns`) → `post_turn` (memory, pacing and evaluation counts, never scores). A blocked message ends with `blocked`.
+
+### Competency evaluation
+
+For each trainee message, one Sage batch over a compact view (recent conversation + the message) asks:
+
+| Question | Kind | Result |
+|---|---|---|
+| `competency.exercised` | tags | which scenario competencies this moment calls for (also when the message handles them badly) |
+| `competency.score:<id>` | scale | the rubric level, with Sage's confidence |
+| `competency.indicators:<id>` | tags | which observable behaviours (to show / to avoid) the message shows |
+| `competency.evidence:<id>` | tags | which sentences of the message the level rests on (exact offsets) |
+
+A `null` answer is never a low score: the row is marked **for review**, and the manager sets the level on the report page. Evidence uses sentence tags, not Extract: Extract finds passages that show a competency, but it cannot quote a weak answer, and a weak answer needs evidence too.
+
+### Report
+
+Ending the simulation builds the report: per competency, the confidence-weighted average of the rubric levels (rows in review are left out), the level description, behaviour counts and evidence quotes; the objectives reached; the final state; and the overall score (weighted by the scenario's competency weights). The summary model then writes short feedback from these facts only. A manager correction recomputes the numbers and keeps the feedback text; "Rebuild report" writes it again.
+
+### State variables and objectives
+
+A scenario can define variables that Sage tracks every turn: `scale` (levels), `choice` (options), `yesno` or `extract` (a typed value from the text). A `null` answer keeps the previous value. A yes/no variable can be an **objective** of the trainee: once reached, it stays reached and is not asked again. When every objective is reached, or the turn limit is reached, the simulation suggests that the trainee ends it.
 
 ### Sage ↔ prompt contract
 
-- Every Sage question is declared once in `backend/app/sage/registry.py` (label key, kind, null policy, threshold, where it renders).
-- Sage answers become **labels** (`backend/app/sage/labels.py`). The assembler reads only labels, never raw Sage JSON, and never shows probabilities to the narrator.
-- Stability: a scene label changes only on a confident answer (≥ 0.7), else the old value is carried and rendered `certainty="tentative"`. A character leaves the scene after two "not present" answers in a row, or at once on a location change.
-- You can **lock** a label in the Play view (Labels tab). Locked labels are not asked and not changed.
-- **Regenerate** reuses the stored labels: no new Sage call, same context.
+- Every fixed Sage question is declared once in `backend/app/sage/registry.py`. State questions are built from the scenario's variables (`state_specs`).
+- Sage answers become **labels** (`backend/app/sage/labels.py`). The assembler reads only labels, never raw Sage JSON, and never shows probabilities or scores to the simulation model.
+- Stability: a scene label changes only on a confident answer (≥ 0.7). A counterpart leaves the scene after two "not present" answers in a row.
+- A manager can **lock** a label or a state variable while testing.
 
-### Why memory is sentence-based
-
-Sage Extract is extractive: it returns spans of the text. It finds names and short phrases well (items, places), but it cannot write a whole fact. So each sentence of the turn is a memory candidate. Sage classifies it (fact, relationship, item, goal, event or none) and tags which present characters witnessed it (`known_by`). The veil of knowledge then puts private memory only inside the `<knows>` block of the characters who know it.
-
-### Prompt layers
+## Prompt layers
 
 | Layer | Scope | Contents |
 |---|---|---|
-| Global preset | all roleplays | main prompt, harness legend, **global rules**, post-history instructions, default Author's Note, block order, budgets |
-| Scenario | one scenario | world, scenario rules (added to the global rules, never replacing them), opening message, main prompt / PHI override with `{{original}}` |
-| Character | one character | description, personality, speech style, first message, examples, depth note, PHI addition |
-| Persona | belongs to one scenario, picked per session | `{{user}}` name and description |
-| Lorebook | one scenario | World Info entries with SillyTavern fields + `known_by` |
-| Session | one playthrough | Author's Note, memory, summary, labels |
+| Global preset | all simulations | main prompt, harness legend, **global rules** (realism, veil of knowledge, trainee agency, no coaching), post-history instructions, block order, budgets |
+| Scenario | one scenario | situation, context tags, scenario rules, briefing, opening message, overrides |
+| Counterpart | one counterpart | description with goals and limits, personality, speech style |
+| Trainee role | one scenario | `{{user}}` name and description |
+| Knowledge base | one scenario | World Info entries (policies, products, facts) |
+| Session | one run | memory, summary, labels, state |
 
-Macros: `{{user}}`, `{{char}}`, `{{persona}}`, `{{scenario}}`, `{{original}}`, `{{location}}`, `{{mood}}`, `{{scene_type}}`, `{{present}}`, `{{time}}`, `{{date}}`, `{{roll::2d6}}`.
-
-Timed lore effects (sticky, cooldown) count in **turns** (one message + one reply). Delay counts messages.
+Macros: `{{user}}`, `{{char}}`, `{{persona}}`, `{{scenario}}`, `{{original}}`, `{{location}}`, `{{stage}}`, `{{tone}}`, `{{present}}`, `{{time}}`, `{{date}}`, `{{roll::2d6}}`.
 
 ## Tests
 
@@ -89,24 +120,26 @@ cd backend && uv run pytest
 cd frontend && npm run build
 ```
 
-The backend tests mock Sage and OpenRouter with `respx`. They cover the clients, World Info activation, labels and stability, request building and limits, the assembler (order, depth injections, veil, overrides, trimming), and full turns over SSE (memory, regenerate, blocked, OOC, degraded mode, label locks, card import).
+The backend tests mock Sage and OpenRouter with `respx`. They cover the clients, World Info, labels and stability, request building and limits, the assembler, full turns over SSE, state variables (questions, stability, Extract values, `<sim_state>`), the competency evaluation (questions, evidence sentences, review rules, regenerate), completion and the report, the results table, and the CRUD validation of the Sage limits.
 
 ## Project layout
 
 ```
 backend/app/
   clients/      sage.py, openrouter.py
-  sage/         registry.py, labels.py, request.py, extract.py
+  sage/         registry.py, labels.py, request.py, extract.py, evaluation.py
+  training/     state.py, competencies.py, report.py, validation.py
   worldinfo/    activation.py
   prompt/       blocks.py, assembler.py, macros.py, budget.py
   harness/      orchestrator.py, state.py, summarizer.py
   api/          routes.py, crud.py
-  importers/    sillytavern.py  (V2/V3 JSON or PNG card, character_book → lorebook)
+  seed.py, seed_library.py, seed_sample.py
 frontend/src/
-  pages/        Library, ScenarioEditor, PromptManager, Play, Settings
-  components/   Field, Inspector (harness, prompt, memory, labels, Author's Note panels)
+  pages/        Library, MyTrainings, ScenarioEditor, Competencies, Team, Results, Play, Report,
+                PromptManager, Settings, ProfilePicker
+  components/   Field, Rubric, Inspector (harness, state, evaluation, prompt, memory, labels, Author's Note)
 ```
 
 ## Not included yet
 
-Embeddings/vector lore matching, lore inclusion groups, group-chat turn order, multi-user auth, image generation, and the Sage streaming endpoint.
+Login and access control, several companies in one installation, embeddings for lore matching, group conversations with turn order, and the Sage streaming endpoint.
