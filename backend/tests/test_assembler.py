@@ -14,7 +14,7 @@ MIRA, KADE = 1, 2
 def base_input(**overrides):
     labels = LabelSet()
     labels.put(Label(key="scene.location", value="Docks", probability=0.93))
-    labels.put(Label(key="scene.mood", value="tense", certainty="carried"))
+    labels.put(Label(key="scene.tone", value="frustrated", certainty="carried"))
     labels.put(Label(key="scene.present", value=[MIRA]))
     inp = AssemblyInput(
         preset=PromptPreset(main_prompt=DEFAULT_MAIN_PROMPT, harness_legend=DEFAULT_HARNESS_LEGEND, post_history=DEFAULT_POST_HISTORY, block_order=default_block_order(), context_size=32000, max_tokens=800),
@@ -116,7 +116,7 @@ def test_no_probabilities_and_tentative_scene():
     everything = "\n".join(m["content"] for m in out.messages)
     assert "0.93" not in everything and "probability" not in everything
     scene = next(m["content"] for m in out.messages if m["content"].startswith("<scene "))
-    assert 'location="Docks"' in scene and 'mood="tense"' in scene and 'present="Mira"' in scene
+    assert 'location="Docks"' in scene and 'tone="frustrated"' in scene and 'present="Mira"' in scene
     assert 'certainty="tentative"' in scene
     assert "Pacing: keep momentum." in scene
 
@@ -126,8 +126,8 @@ def test_scenario_overrides_keep_original():
     inp.scenario.main_prompt_override = "{{original}}\nFocus on the docks."
     inp.scenario.post_history_override = "Be terse. {{original}}"
     out = assemble(inp)
-    assert "You are the narrator" in system_text(out) and "Focus on the docks." in system_text(out)
-    assert out.messages[-1]["content"].startswith("<post_history>\nBe terse. Stay in character")
+    assert "You run a workplace training simulation" in system_text(out) and "Focus on the docks." in system_text(out)
+    assert out.messages[-1]["content"].startswith("<post_history>\nBe terse. Stay in the role of the counterparts")
 
 
 def test_ooc_instruction_in_post_history():

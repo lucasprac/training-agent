@@ -16,6 +16,8 @@ export interface Scenario {
   authors_note_depth: number | null
   authors_note_frequency: number | null
   model: string
+  briefing: string
+  max_turns: number
   created_at: string
 }
 
@@ -92,6 +94,7 @@ export interface Preset {
   max_tokens: number
   context_size: number
   sage_reasoning: string
+  evaluation_reasoning: string
 }
 
 export interface GlobalRule {
@@ -107,6 +110,9 @@ export interface RpSession {
   id: number
   scenario_id: number
   persona_id: number | null
+  profile_id: number | null
+  status: 'active' | 'completed'
+  completed_at: string | null
   title: string
   model: string
   authors_note: string | null
@@ -190,6 +196,7 @@ export interface PromptPublic {
 
 export interface PostTurnReport {
   memory_added: { kind: string; content: string; known_by: number[] }[]
+  evaluation?: { competencies: number; needs_review: number }
   errors: string[]
   stalling?: number
   location?: string
@@ -238,22 +245,143 @@ export const api = {
   put: <T>(path: string, body: unknown) => request<T>('PUT', path, body),
   del: (path: string) => request<{ ok: boolean }>('DELETE', path),
 
-  async importCard(file: File): Promise<{ scenario: Scenario; lore_count: number }> {
-    const form = new FormData()
-    form.append('file', file)
-    const response = await fetch('/api/import/card', { method: 'POST', body: form })
-    if (!response.ok) {
-      const data = await response.json().catch(() => ({ detail: response.statusText }))
-      throw new Error(String(data.detail))
-    }
-    return response.json()
-  },
+}
+
+export type EndReason = 'max_turns' | 'objectives' | null
+
+// ----------------------------------------------------------------- training
+
+export type ProfileRole = 'manager' | 'user'
+
+export interface Profile {
+  id: number
+  name: string
+  role: ProfileRole
+}
+
+export interface Indicator {
+  id: string
+  text: string
+  polarity: 'positive' | 'negative'
+}
+
+export interface RubricLevel {
+  level: number
+  description: string
+}
+
+export interface Competency {
+  id: number
+  name: string
+  description: string
+  indicators: Indicator[]
+  levels: RubricLevel[]
+  enabled: boolean
+}
+
+export interface ScenarioCompetency {
+  id: number
+  scenario_id: number
+  competency_id: number
+  weight: number
+  focus: string
+  order: number
+}
+
+export type StateKind = 'choice' | 'scale' | 'yesno' | 'extract'
+
+export interface ChoiceOption {
+  option: string
+  description: string
+}
+
+export interface StateVariable {
+  id: number
+  scenario_id: number
+  name: string
+  kind: StateKind
+  instructions: string
+  options: (ChoiceOption | RubricLevel)[]
+  extract_type: string
+  initial_value: unknown
+  tell_narrator: boolean
+  is_objective: boolean
+  order: number
+  enabled: boolean
+  key?: string
+}
+
+export interface Assignment {
+  id: number
+  scenario_id: number
+  profile_id: number
+  due_date: string | null
+  note: string
+}
+
+export interface EvidenceSpan {
+  text: string
+  start: number
+  end: number
+  probability: number | null
+}
+
+export interface Evaluation {
+  id: number
+  session_id: number
+  turn_index: number
+  message_id: number
+  competency_id: number
+  exercised_probability: number | null
+  score: number | null
+  confidence: number | null
+  indicators: { id: string; applies: boolean | null; probability: number | null }[]
+  evidence: EvidenceSpan[]
+  needs_review: boolean
+  review_reason: string
+  source: 'sage' | 'manager'
+  note: string
+}
+
+export interface CompetencyResult {
+  competency_id: number
+  name: string
+  description: string
+  weight: number
+  min_level: number
+  max_level: number
+  observed: number
+  needs_review: number
+  score: number | null
+  percent: number | null
+  level_description: string | null
+  status: 'scored' | 'review_only' | 'not_observed'
+  indicators: (Indicator & { count: number })[]
+  evidence: { turn_index: number; message_id: number; message: string; spans: { start: number; end: number; text: string }[] }[]
+}
+
+export interface Report {
+  generated_at: string
+  turns: number
+  overall_percent: number | null
+  competencies: CompetencyResult[]
+  objectives: { id: number; name: string; reached: boolean }[]
+  objectives_reached: number
+  final_state: { id: number; name: string; value: string | null }[]
+  pending_review: number
+  feedback: string
+  feedback_error?: string
+}
+
+export interface ResultsTable {
+  competencies: { id: number; name: string }[]
+  rows: { profile_id: number | null; name: string | null; sessions: number; overall_percent: number | null; competencies: Record<string, number>; last_completed_at: string | null }[]
 }
 
 export type TurnEvent =
   | { event: 'harness'; data: { state: HarnessStatePublic; prompt: PromptPublic | null; user_message_id?: number } }
   | { event: 'token'; data: { text: string } }
-  | { event: 'done'; data: { message_id: number; user_message_id: number; usage?: Record<string, number> } }
+  | { event: 'done'; data: { message_id: number; user_message_id: number; turn_count: number; usage?: Record<string, number>; end_reason: EndReason } }
   | { event: 'post_turn'; data: PostTurnReport }
   | { event: 'blocked'; data: { message_id: number; reason: string } }
   | { event: 'error'; data: { message: string } }

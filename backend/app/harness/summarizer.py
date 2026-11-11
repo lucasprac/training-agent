@@ -3,14 +3,16 @@
 from app.clients.openrouter import OpenRouterClient
 from app.models import Message
 from app.prompt.budget import estimate_tokens
+from app.sage.request import SIMULATION_SPEAKER
 
 SUMMARY_TRIGGER_RATIO = 0.4  # summarize when unsummarized history > 40% of context
 KEEP_RECENT_MESSAGES = 8
 
 SUMMARY_SYSTEM = (
-    "You maintain the running summary of an interactive story. Write in the past tense, "
-    "third person, as compact factual prose. Keep names, places, objects, promises, "
-    "secrets (and who knows them) and unresolved threads. Drop style and dialogue."
+    "You maintain the running summary of a workplace training simulation. Write in the past tense, "
+    "third person, as compact factual prose, in the language of the transcript. Keep names, "
+    "requests, offers, values, commitments, objections, secrets (and who knows them) and "
+    "unresolved issues. Drop style and small talk."
 )
 
 
@@ -36,7 +38,7 @@ async def update_summary(
     persona_name: str,
 ) -> str:
     transcript = "\n\n".join(
-        f"{persona_name if m.role == 'user' else 'Narrator'}: {m.content}" for m in to_fold
+        f"{persona_name if m.role == 'user' else SIMULATION_SPEAKER}: {m.content}" for m in to_fold
     )
     prompt = (
         f"Current summary:\n{current_summary or '(none yet)'}\n\n"

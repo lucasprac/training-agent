@@ -12,6 +12,7 @@ from app.prompt.budget import estimate_tokens
 from app.sage.labels import LabelSet
 from app.sage.registry import (
     BY_KEY,
+    QuestionSpec,
     SageContext,
     build_question,
     question_id,
@@ -20,6 +21,7 @@ from app.sage.registry import (
 
 SAGE_VIEW_TOKENS = 6000
 POST_TURN_VIEW_TOKENS = 3000
+SIMULATION_SPEAKER = "Simulation"
 
 
 @dataclass
@@ -33,7 +35,7 @@ class BuiltRequest:
 
 
 def speaker(message: Message, persona_name: str) -> str:
-    return persona_name if message.role == "user" else "Narrator"
+    return persona_name if message.role == "user" else SIMULATION_SPEAKER
 
 
 def format_chat(messages: list[Message], persona_name: str, budget_tokens: int) -> str:
@@ -66,8 +68,8 @@ def scene_text(labels: LabelSet, characters: list[Character]) -> str:
     present = ", ".join(names[i] for i in labels.value("scene.present", []) if i in names)
     return (
         f"location: {labels.value('scene.location', 'unknown')}; "
-        f"type: {labels.value('scene.type', 'unknown')}; "
-        f"mood: {labels.value('scene.mood', 'unknown')}; "
+        f"stage: {labels.value('scene.stage', 'unknown')}; "
+        f"tone: {labels.value('scene.tone', 'unknown')}; "
         f"present: {present or 'unknown'}"
     )
 
@@ -80,19 +82,24 @@ def build_sage_view(
     persona_name: str,
     history: list[Message],
     budget_tokens: int = SAGE_VIEW_TOKENS,
+    state_lines: list[str] | None = None,
 ) -> str:
-    """`history` is oldest -> newest and ends with the new user message."""
-    header = "\n".join(
-        [
-            "<rules>",
-            rules_text(rules, scenario_rules),
-            "</rules>",
-            f"<scene_state>{scene_text(labels, characters)}</scene_state>",
-            f"<cast>{persona_name} is the player. Characters: "
-            + (", ".join(c.name for c in characters) or "none")
-            + "</cast>",
-        ]
+    """`history` is oldest -> newest and ends with the new user message.
+    `state_lines` are the current simulation variables ("- name: value")."""
+    parts = [
+        "<rules>",
+        rules_text(rules, scenario_rules),
+        "</rules>",
+        f"<scene_state>{scene_text(labels, characters)}</scene_state>",
+    ]
+    if state_lines:
+        parts.append("<sim_state>\n" + "\n".join(state_lines) + "\n</sim_state>")
+    parts.append(
+        f"<cast>{persona_name} is the trainee. Counterparts: "
+        + (", ".join(c.name for c in characters) or "none")
+        + "</cast>"
     )
+    header = "\n".join(parts)
     remaining = max(budget_tokens - estimate_tokens(header) - 50, 500)
     earlier, last = history[:-1], history[-1:]
     last_text = format_chat(last, persona_name, remaining // 2) if last else ""
@@ -103,10 +110,13 @@ def build_sage_view(
     )
 
 
-def build_pre_turn(view: str, ctx: SageContext, locked: set[str]) -> BuiltRequest:
+def build_pre_turn(
+    view: str, ctx: SageContext, locked: set[str], extra_specs: list[QuestionSpec] | None = None
+) -> BuiltRequest:
+    """Registry questions plus `extra_specs` (the scenario's state variables), minus locked keys."""
     questions: list[dict[str, Any]] = []
     qid_to_key: dict[str, str] = {}
-    for spec in specs_for("pre_turn"):
+    for spec in [*specs_for("pre_turn"), *(extra_specs or [])]:
         if spec.key in locked and spec.lockable:
             continue
         question = build_question(spec, ctx)

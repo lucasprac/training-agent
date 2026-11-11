@@ -59,6 +59,7 @@ class Answer(BaseModel):
     kind: str
     value: Any = None  # yesno: True/False/None; choice: str/None; scale: float; tags: dict
     probability: float | None = None
+    probabilities: list[dict[str, Any]] | None = None  # choice options / scale levels
 
 
 def parse_answer(result: dict[str, Any]) -> Answer:
@@ -70,9 +71,11 @@ def parse_answer(result: dict[str, Any]) -> Answer:
         value = None if answer is None else answer == "yes"
         return Answer(kind=kind, value=value, probability=body.get("probability"))
     if kind == "choice":
-        return Answer(kind=kind, value=body.get("chosen"), probability=body.get("probability"))
+        return Answer(kind=kind, value=body.get("chosen"), probability=body.get("probability"),
+                      probabilities=body.get("probabilities"))
     if kind == "scale":
-        return Answer(kind=kind, value=body.get("expectation"), probability=body.get("confidence"))
+        return Answer(kind=kind, value=body.get("expectation"), probability=body.get("confidence"),
+                      probabilities=body.get("probabilities"))
     if kind == "tags":
         tags = {
             str(t.get("id")): {"applies": t.get("applies"), "probability": t.get("probability")}
@@ -199,6 +202,61 @@ def apply_present(
         source="sage" if answer else (previous.source if previous else "default"),
         turn=turn,
     )
+    labels.put(label)
+    return label
+
+
+SCALE_MIN_CONFIDENCE = 0.5
+EXTRACT_MIN_PROBABILITY = 0.6
+
+
+def _carry(key: str, previous: Label | None, probability: float | None, turn: int) -> Label:
+    return Label(
+        key=key,
+        value=previous.value if previous else None,
+        probability=probability,
+        certainty="carried" if previous and previous.value is not None else "low",
+        source=previous.source if previous else "sage",
+        turn=turn,
+    )
+
+
+def apply_state(
+    labels: LabelSet,
+    key: str,
+    kind: str,
+    answer: Answer | None,
+    threshold: float,
+    turn: int,
+    objective: bool = False,
+) -> Label:
+    """A state variable. A `null` answer keeps the previous value. A reached objective stays reached."""
+    previous = labels.get(key)
+    if previous and (previous.locked or (objective and previous.value is True)):
+        return previous
+    if kind == "choice":
+        return apply_choice(labels, key, answer, threshold, turn, unchanged_option="")
+    if answer is None or answer.value is None:
+        label = _carry(key, previous, answer.probability if answer else None, turn)
+    elif kind == "scale":
+        confident = (answer.probability or 0.0) >= SCALE_MIN_CONFIDENCE
+        label = Label(key=key, value=round(float(answer.value), 2), probability=answer.probability,
+                      certainty="high" if confident else "low", source="sage", turn=turn)
+    else:
+        label = Label(key=key, value=answer.value, probability=answer.probability, certainty="high", source="sage", turn=turn)
+    labels.put(label)
+    return label
+
+
+def apply_extracted(labels: LabelSet, key: str, value: Any, probability: float | None, turn: int) -> Label:
+    """An Extract value replaces the previous one only when it is present and probable enough."""
+    previous = labels.get(key)
+    if previous and previous.locked:
+        return previous
+    if value is None or (probability is not None and probability < EXTRACT_MIN_PROBABILITY):
+        label = _carry(key, previous, probability, turn)
+    else:
+        label = Label(key=key, value=value, probability=probability, certainty="high", source="extract", turn=turn)
     labels.put(label)
     return label
 

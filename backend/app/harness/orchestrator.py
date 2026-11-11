@@ -3,11 +3,12 @@
 This is the only module that uses both `app.sage` and `app.prompt`.
 """
 
+import asyncio
 import logging
 import random
 import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from sqlalchemy import Engine
@@ -18,16 +19,27 @@ from app.clients.sage import SageClient, SageError
 from app.config import Settings
 from app.harness import summarizer
 from app.harness.state import HarnessState
+from app.sage.evaluation import (
+    ScenarioCompetencyItem,
+    build_evaluation,
+    evaluation_view,
+    sentence_spans,
+    to_evaluations,
+)
+from app.training import state as sim_state
+from app.training.competencies import scenario_competencies
 from app.models import (
     Character,
+    Evaluation,
     GlobalRule,
     LoreEntry,
     MemoryItem,
     Message,
     Persona,
     PromptPreset,
-    RoleplaySession,
+    TrainingSession,
     Scenario,
+    StateVariable,
     TurnTrace,
 )
 from app.prompt.assembler import AssemblyInput, AssemblyOutput, AuthorsNote, assemble
@@ -38,11 +50,14 @@ from app.sage.extract import (
     candidate_sentences,
     location_schema,
     map_location,
+    map_state,
+    state_schema,
     subjects_in,
 )
-from app.sage.registry import BY_KEY, ELSEWHERE, SageContext
+from app.sage.registry import BY_KEY, ELSEWHERE, SageContext, state_specs
 from app.sage.request import (
     POST_TURN_VIEW_TOKENS,
+    SIMULATION_SPEAKER,
     build_post_turn,
     build_pre_turn,
     build_sage_view,
@@ -60,17 +75,35 @@ log = logging.getLogger(__name__)
 
 MAX_MEMORY_POOL = 120
 DEGRADED_MEMORY_COUNT = 15
+EXTRACT_VIEW_TOKENS = 2000  # state Extract reads the last exchange only
+
+
+async def _nothing() -> None:
+    return None
 
 GUIDANCE_CAUTION = "Caution: keep this reply within the global and scenario rules."
 PACING_NOTES = {
-    3: "Pacing: the scene is stalling. Introduce a complication, a new arrival or a consequence.",
-    2: "Pacing: keep momentum. Let the characters act on their own goals.",
+    3: "Pacing: the conversation is stalling. Let a counterpart move it forward: raise a new concern, ask for a decision or add realistic pressure.",
+    2: "Pacing: keep momentum. Let the counterparts act on their own goals.",
 }
+
+
+NOT_COUNTED = "The turn was not counted. Send your message again."
+
+
+@dataclass
+class TurnUndo:
+    """What a failed turn must remove or put back."""
+
+    session_id: int
+    user_message_id: int | None = None  # a new trainee message
+    session_fields: dict[str, Any] = field(default_factory=dict)  # session values before the turn
+    replies: list[dict[str, Any]] = field(default_factory=list)  # replies deleted by a regenerate
 
 
 @dataclass
 class TurnContext:
-    session: RoleplaySession
+    session: TrainingSession
     scenario: Scenario
     characters: list[Character]
     persona: Persona | None
@@ -79,6 +112,8 @@ class TurnContext:
     lore: list[LoreEntry]
     memory: list[MemoryItem]
     messages: list[Message]  # all non-blocked messages, chronological
+    state_variables: list[StateVariable] = field(default_factory=list)  # enabled, in order
+    competencies: list[ScenarioCompetencyItem] = field(default_factory=list)
 
     @property
     def persona_name(self) -> str:
@@ -96,7 +131,7 @@ class TurnContext:
 
 
 def load_context(db: Session, session_id: int) -> TurnContext:
-    session = db.get(RoleplaySession, session_id)
+    session = db.get(TrainingSession, session_id)
     if session is None:
         raise LookupError(f"session {session_id} not found")
     scenario = db.get(Scenario, session.scenario_id)
@@ -121,6 +156,8 @@ def load_context(db: Session, session_id: int) -> TurnContext:
                 .order_by(Message.turn_index, Message.id)
             )
         ),
+        state_variables=sim_state.active(list(db.exec(select(StateVariable).where(StateVariable.scenario_id == scenario.id)))),
+        competencies=scenario_competencies(db, scenario.id),
     )
 
 
@@ -145,10 +182,26 @@ def authors_note_for(ctx: TurnContext) -> AuthorsNote:
     return AuthorsNote(text=text or "", position=p.authors_note_position, depth=depth, frequency=freq)
 
 
-def initial_labels(characters: list[Character]) -> L.LabelSet:
+def initial_labels(characters: list[Character], variables: list[StateVariable] | None = None) -> L.LabelSet:
     labels = L.LabelSet()
     labels.put(L.Label(key="scene.present", value=[c.id for c in characters], certainty="low", source="default"))
+    sim_state.put_initial(labels, variables or [])
     return labels
+
+
+def reached_objectives(labels: L.LabelSet, variables: list[StateVariable]) -> set[str]:
+    """Objectives already reached: they are not asked again."""
+    return {sim_state.state_key(v.id) for v in variables if v.is_objective and labels.value(sim_state.state_key(v.id)) is True}
+
+
+def end_reason(ctx: TurnContext, labels: L.LabelSet, turn: int) -> str | None:
+    """Why the trainee should end the simulation now: "max_turns", "objectives", or None."""
+    if ctx.scenario.max_turns and turn >= ctx.scenario.max_turns:
+        return "max_turns"
+    objectives = [v for v in ctx.state_variables if v.is_objective]
+    if objectives and len(reached_objectives(labels, objectives)) == len(objectives):
+        return "objectives"
+    return None
 
 
 class Harness:
@@ -165,6 +218,7 @@ class Harness:
         self.openrouter = openrouter
         self.settings = settings
         self.rng = rng or random.Random()
+        self._background: set[asyncio.Task] = set()  # post-turn tasks that outlive a closed stream
 
     # ------------------------------------------------------------- pre-turn
 
@@ -172,7 +226,7 @@ class Harness:
         """`history` ends with the new user message."""
         session, preset = ctx.session, ctx.preset
         turn = history[-1].turn_index
-        labels = L.LabelSet.from_json(session.labels) if session.labels else initial_labels(ctx.characters)
+        labels = L.LabelSet.from_json(session.labels) if session.labels else initial_labels(ctx.characters, ctx.state_variables)
         state = HarnessState(labels=labels)
         texts = [m.content for m in history]
         previous_location = labels.value("scene.location")
@@ -190,24 +244,44 @@ class Harness:
             memory_pool=memory_pool,
             present_ids=present_before,
         )
-        view = build_sage_view(ctx.rules, ctx.scenario.scenario_rules, labels, ctx.characters, ctx.persona_name, history)
-        built = build_pre_turn(view, sage_ctx, labels.locked_keys())
+        view = build_sage_view(
+            ctx.rules, ctx.scenario.scenario_rules, labels, ctx.characters, ctx.persona_name, history,
+            state_lines=sim_state.state_lines(ctx.state_variables, labels, narrator_only=False),
+        )
+        skip = labels.locked_keys() | reached_objectives(labels, ctx.state_variables)
+        extra_specs = state_specs(ctx.state_variables)
+        built = build_pre_turn(view, sage_ctx, skip, extra_specs)
+        extract_vars = [v for v in ctx.state_variables if v.kind == "extract" and sim_state.state_key(v.id) not in skip]
         answers: dict[str, L.Answer] = {}
-        state.sage = {"questions": built.question_count}
+        extracted: dict[int, tuple[Any, float | None]] = {}
+        state.sage = {"questions": built.question_count, "extract_fields": len(extract_vars)}
 
         if not self.sage.configured:
             state.degraded.append("sage_not_configured")
-        elif built.requests:
+        elif built.requests or extract_vars:
             started = time.perf_counter()
-            try:
-                response = await self.sage.decide_batch(built.requests, preset.sage_reasoning)
-                raw, errors = L.parse_batch(response)
+            decide, extract = await asyncio.gather(
+                self.sage.decide_batch(built.requests, preset.sage_reasoning) if built.requests else _nothing(),
+                self.sage.extract(format_chat(history[-2:], ctx.persona_name, EXTRACT_VIEW_TOKENS), state_schema(extract_vars))
+                if extract_vars else _nothing(),
+                return_exceptions=True,
+            )
+            if isinstance(decide, SageError):
+                state.degraded.append(f"sage_pre_turn: {decide}")
+            elif isinstance(decide, BaseException):
+                raise decide
+            elif decide is not None:
+                raw, errors = L.parse_batch(decide)
                 answers = {built.qid_to_key.get(qid, qid): a for qid, a in raw.items()}
-                state.sage["usage"] = (response.get("meta") or {}).get("usage")
+                state.sage["usage"] = (decide.get("meta") or {}).get("usage")
                 if errors:
                     state.sage["errors"] = errors
-            except SageError as exc:
-                state.degraded.append(f"sage_pre_turn: {exc}")
+            if isinstance(extract, SageError):
+                state.sage["extract_error"] = str(extract)
+            elif isinstance(extract, BaseException):
+                raise extract
+            elif extract is not None:
+                extracted = map_state(extract, extract_vars)
             state.sage["latency_ms"] = round((time.perf_counter() - started) * 1000)
 
         if state.degraded:
@@ -221,8 +295,8 @@ class Harness:
             if limits.value is None:
                 state.guidance.append(GUIDANCE_CAUTION)
             loc = L.apply_choice(labels, "scene.location", answers.get("scene.location"), BY_KEY["scene.location"].threshold, turn)
-            L.apply_choice(labels, "scene.type", answers.get("scene.type"), BY_KEY["scene.type"].threshold, turn)
-            L.apply_choice(labels, "scene.mood", answers.get("scene.mood"), BY_KEY["scene.mood"].threshold, turn)
+            L.apply_choice(labels, "scene.stage", answers.get("scene.stage"), BY_KEY["scene.stage"].threshold, turn)
+            L.apply_choice(labels, "scene.tone", answers.get("scene.tone"), BY_KEY["scene.tone"].threshold, turn)
             location_changed = loc.certainty == "high" and loc.value != previous_location and previous_location is not None
             L.apply_present(labels, answers.get("scene.present"), [c.id for c in ctx.characters], turn, location_changed)
             selected_lore = finalize(activation, L.tag_applies(answers.get("select.lore"), "l") or {})
@@ -231,6 +305,14 @@ class Harness:
                 state.memory = memory_pool[:DEGRADED_MEMORY_COUNT] if memory_pool else []
             else:
                 state.memory = [m for m in memory_pool if memory_applies.get(m.id) is not False]
+            objectives = {sim_state.state_key(v.id) for v in ctx.state_variables if v.is_objective}
+            for spec in extra_specs:
+                if spec.key not in skip:
+                    L.apply_state(labels, spec.key, spec.kind, answers.get(spec.key), spec.threshold, turn, spec.key in objectives)
+        # Extract runs apart from Decide, so its values count even when Decide failed.
+        for var in extract_vars:
+            if var.id in extracted:
+                L.apply_extracted(labels, sim_state.state_key(var.id), *extracted[var.id], turn)
 
         if session.pacing_note:
             state.guidance.append(session.pacing_note)
@@ -273,6 +355,7 @@ class Harness:
                 turn=max(history[-1].turn_index, 1) if history else 1,
                 ooc=state.ooc,
                 rng=self.rng,
+                state_variables=ctx.state_variables,
             )
         )
 
@@ -281,130 +364,197 @@ class Harness:
     async def run_turn(
         self, session_id: int, user_text: str | None, regenerate: bool = False
     ) -> AsyncIterator[dict[str, Any]]:
-        """Yield SSE events: harness, token*, done | blocked | error."""
+        """Yield SSE events: harness, token*, done, post_turn | blocked | error.
+
+        A turn counts only when the counterpart reply is saved. If the reply fails (model
+        error, empty reply, stopped stream), the turn is undone: a new trainee message is
+        removed and the session is restored, and a regenerated reply is put back.
+        A blocked message stays in the history (marked blocked) but does not use a turn.
+        """
         with Session(self.engine) as db:
             try:
                 ctx = load_context(db, session_id)
             except LookupError as exc:
                 yield {"event": "error", "data": {"message": str(exc)}}
                 return
+            if ctx.session.status == "completed":
+                yield {"event": "error", "data": {"message": "This simulation is completed."}}
+                return
+            max_turns = ctx.scenario.max_turns
+            if not regenerate and max_turns and ctx.session.turn_count >= max_turns:
+                yield {"event": "error", "data": {"message": "The turn limit of this simulation is reached. End the simulation to see the report."}}
+                return
+            if not regenerate and not (user_text or "").strip():
+                yield {"event": "error", "data": {"message": "empty message"}}
+                return
 
-            if regenerate:
-                user_messages = [m for m in ctx.messages if m.role == "user"]
-                if not user_messages:
-                    yield {"event": "error", "data": {"message": "nothing to regenerate"}}
-                    return
-                user_msg = user_messages[-1]
-                for m in ctx.messages:
-                    if m.role == "assistant" and m.turn_index == user_msg.turn_index:
-                        db.delete(m)
-                db.commit()
-                ctx = load_context(db, session_id)
-                user_msg = db.get(Message, user_msg.id)
-                if user_msg.harness:
-                    state = self.state_from_snapshot(ctx, user_msg.harness)
+            undo = TurnUndo(session_id=session_id)
+            finished = False
+            try:
+                if regenerate:
+                    user_messages = [m for m in ctx.messages if m.role == "user"]
+                    if not user_messages:
+                        yield {"event": "error", "data": {"message": "nothing to regenerate"}}
+                        return
+                    user_msg = user_messages[-1]
+                    for m in ctx.messages:
+                        if m.role == "assistant" and m.turn_index == user_msg.turn_index:
+                            undo.replies.append(m.model_dump(exclude={"id"}))
+                            db.delete(m)
+                    db.commit()
+                    ctx = load_context(db, session_id)
+                    user_msg = db.get(Message, user_msg.id)
+                    if user_msg.harness:
+                        state = self.state_from_snapshot(ctx, user_msg.harness)
+                    else:
+                        history = [m for m in ctx.narrator_history if m.turn_index <= user_msg.turn_index]
+                        state = await self.pre_turn(ctx, history)
                 else:
+                    session = ctx.session
+                    undo.session_fields = {
+                        "turn_count": session.turn_count,
+                        "labels": session.labels,
+                        "lore_timers": session.lore_timers,
+                    }
+                    user_msg = Message(
+                        session_id=session_id,
+                        turn_index=session.turn_count + 1,
+                        role="user",
+                        content=(user_text or "").strip(),
+                    )
+                    db.add(user_msg)
+                    db.commit()
+                    db.refresh(user_msg)
+                    undo.user_message_id = user_msg.id
+                    ctx.messages.append(user_msg)
                     history = [m for m in ctx.narrator_history if m.turn_index <= user_msg.turn_index]
                     state = await self.pre_turn(ctx, history)
-            else:
-                if not (user_text or "").strip():
-                    yield {"event": "error", "data": {"message": "empty message"}}
+
+                turn = user_msg.turn_index
+                user_msg.harness = state.snapshot()
+                user_msg.ooc = state.ooc
+                db.add(user_msg)
+
+                if state.blocked:
+                    # Keep the message as a record. It does not use a turn or change the state.
+                    user_msg.blocked = True
+                    db.commit()
+                    finished = True
+                    yield {"event": "harness", "data": {"state": state.public(), "prompt": None}}
+                    yield {
+                        "event": "blocked",
+                        "data": {
+                            "message_id": user_msg.id,
+                            "reason": "This message breaks the global or scenario rules. Change it and send it again.",
+                        },
+                    }
                     return
-                user_msg = Message(
-                    session_id=session_id,
-                    turn_index=ctx.session.turn_count + 1,
-                    role="user",
-                    content=user_text.strip(),
-                )
-                db.add(user_msg)
-                db.commit()
-                db.refresh(user_msg)
-                ctx.messages.append(user_msg)
-                history = [m for m in ctx.narrator_history if m.turn_index <= user_msg.turn_index]
-                state = await self.pre_turn(ctx, history)
 
-            turn = user_msg.turn_index
-            user_msg.harness = state.snapshot()
-            user_msg.ooc = state.ooc
-            session = ctx.session
-            if not regenerate:
-                session.turn_count = turn
-                session.labels = state.labels.model_dump()
-                session.lore_timers = update_timers(session.lore_timers, state.lore, turn)
-            db.add(user_msg)
-            db.add(session)
-            db.commit()
-
-            if state.blocked:
-                user_msg.blocked = True
-                db.add(user_msg)
+                session = ctx.session
+                if not regenerate:
+                    session.turn_count = turn
+                    session.labels = state.labels.model_dump()
+                    session.lore_timers = update_timers(session.lore_timers, state.lore, turn)
+                db.add(session)
                 db.commit()
-                yield {"event": "harness", "data": {"state": state.public(), "prompt": None}}
+
+                history = [m for m in ctx.narrator_history if m.turn_index <= turn]
+                prompt = self.build_prompt(ctx, state, history)
                 yield {
-                    "event": "blocked",
-                    "data": {
-                        "message_id": user_msg.id,
-                        "reason": "This message breaks the global or scenario rules. Edit it and try again.",
-                    },
+                    "event": "harness",
+                    "data": {"state": state.public(), "prompt": _prompt_public(prompt), "user_message_id": user_msg.id},
                 }
-                return
 
-            history = [m for m in ctx.narrator_history if m.turn_index <= turn]
-            prompt = self.build_prompt(ctx, state, history)
-            yield {
-                "event": "harness",
-                "data": {"state": state.public(), "prompt": _prompt_public(prompt), "user_message_id": user_msg.id},
-            }
+                chunks: list[str] = []
+                usage: dict[str, Any] = {}
+                started = time.perf_counter()
+                try:
+                    async for item in self.openrouter.stream_chat(
+                        ctx.model or self.settings.default_model,
+                        prompt.messages,
+                        temperature=ctx.preset.temperature,
+                        max_tokens=ctx.preset.max_tokens,
+                    ):
+                        if item["type"] == "token":
+                            chunks.append(item["text"])
+                            yield {"event": "token", "data": {"text": item["text"]}}
+                        else:
+                            usage = {"usage": item.get("usage"), "finish_reason": item.get("finish_reason")}
+                except OpenRouterError as exc:
+                    yield {"event": "error", "data": {"message": f"{exc} {NOT_COUNTED}"}}
+                    return
 
-            chunks: list[str] = []
-            usage: dict[str, Any] = {}
-            started = time.perf_counter()
-            try:
-                async for item in self.openrouter.stream_chat(
-                    ctx.model or self.settings.default_model,
-                    prompt.messages,
-                    temperature=ctx.preset.temperature,
-                    max_tokens=ctx.preset.max_tokens,
-                ):
-                    if item["type"] == "token":
-                        chunks.append(item["text"])
-                        yield {"event": "token", "data": {"text": item["text"]}}
-                    else:
-                        usage = {"usage": item.get("usage"), "finish_reason": item.get("finish_reason")}
-            except OpenRouterError as exc:
-                yield {"event": "error", "data": {"message": str(exc), "user_message_id": user_msg.id}}
-                return
+                reply = "".join(chunks).strip()
+                if not reply:
+                    yield {"event": "error", "data": {"message": f"The simulation model sent an empty reply. {NOT_COUNTED}"}}
+                    return
 
-            reply = "".join(chunks).strip()
-            assistant = Message(session_id=session_id, turn_index=turn, role="assistant", content=reply, ooc=state.ooc)
-            db.add(assistant)
-            trace = TurnTrace(
-                session_id=session_id,
-                turn_index=turn,
-                data={
-                    "regenerate": regenerate,
-                    "harness": state.snapshot(),
-                    "prompt": _prompt_public(prompt),
-                    "narrator": {
-                        "model": ctx.model or self.settings.default_model,
-                        "latency_ms": round((time.perf_counter() - started) * 1000),
-                        **usage,
+                assistant = Message(session_id=session_id, turn_index=turn, role="assistant", content=reply, ooc=state.ooc)
+                db.add(assistant)
+                trace = TurnTrace(
+                    session_id=session_id,
+                    turn_index=turn,
+                    data={
+                        "regenerate": regenerate,
+                        "harness": state.snapshot(),
+                        "prompt": _prompt_public(prompt),
+                        "narrator": {
+                            "model": ctx.model or self.settings.default_model,
+                            "latency_ms": round((time.perf_counter() - started) * 1000),
+                            **usage,
+                        },
                     },
-                },
-            )
-            db.add(trace)
-            db.commit()
-            db.refresh(assistant)
-            db.refresh(trace)
-            yield {"event": "done", "data": {"message_id": assistant.id, "user_message_id": user_msg.id, **usage}}
+                )
+                db.add(trace)
+                db.commit()
+                finished = True
+                db.refresh(assistant)
+                db.refresh(trace)
+                user_msg_id, assistant_id, trace_id = user_msg.id, assistant.id, trace.id
+                done = {
+                    "message_id": assistant_id,
+                    "user_message_id": user_msg_id,
+                    "turn_count": session.turn_count,
+                    **usage,
+                    "end_reason": end_reason(ctx, state.labels, turn),
+                }
+            finally:
+                if not finished:
+                    self._undo_turn(db, undo)
 
-            user_msg_id, assistant_id, trace_id = user_msg.id, assistant.id, trace.id
-
-        # Post-turn runs after "done" on the same stream: the reply is already shown,
-        # and the browser gets the memory/pacing result as a final "post_turn" event.
-        if not state.ooc and reply:
-            report = await self.post_turn(session_id, user_msg_id, assistant_id, trace_id)
+        # Post-turn runs after "done" on the same stream: the reply is already shown, and the
+        # browser gets the memory/pacing/evaluation result as a final "post_turn" event. It is
+        # a shielded task that starts before "done", so it also completes when the browser
+        # closes the stream (for example with Stop): the trainee message is always evaluated.
+        task = None
+        if not state.ooc:
+            task = asyncio.create_task(self.post_turn(session_id, user_msg_id, assistant_id, trace_id))
+            self._background.add(task)
+            task.add_done_callback(self._background.discard)
+        yield {"event": "done", "data": done}
+        if task is not None:
+            report = await asyncio.shield(task)
             yield {"event": "post_turn", "data": report}
+
+    def _undo_turn(self, db: Session, undo: TurnUndo) -> None:
+        """Remove what a failed turn saved, so that the trainee can send the message again."""
+        try:
+            db.rollback()
+            if undo.user_message_id is not None:
+                message = db.get(Message, undo.user_message_id)
+                if message is not None:
+                    db.delete(message)
+            if undo.session_fields:
+                session = db.get(TrainingSession, undo.session_id)
+                if session is not None:
+                    for key, value in undo.session_fields.items():
+                        setattr(session, key, value)
+                    db.add(session)
+            for data in undo.replies:
+                db.add(Message(**data))
+            db.commit()
+        except Exception:  # never hide the original failure
+            log.exception("could not undo the failed turn of session %s", undo.session_id)
 
     # ------------------------------------------------------------- post-turn
 
@@ -419,7 +569,7 @@ class Harness:
                     return report
                 labels = L.LabelSet.from_json(ctx.session.labels)
                 present = labels.value("scene.present", [c.id for c in ctx.characters])
-                turn_text = f"{ctx.persona_name}: {user_msg.content}\n\nNarrator: {reply.content}"
+                turn_text = f"{ctx.persona_name}: {user_msg.content}\n\n{SIMULATION_SPEAKER}: {reply.content}"
                 if self.sage.configured:
                     await self._extract_location(labels, turn_text, ctx.persona_name, user_msg.turn_index, report)
                     sentences = candidate_sentences(user_msg.content, reply.content, ctx.persona_name, [m.content for m in ctx.memory])
@@ -427,16 +577,24 @@ class Harness:
                     recent_view = format_chat(ctx.messages[-8:], ctx.persona_name, POST_TURN_VIEW_TOKENS)
                     built = build_post_turn(turn_text, recent_view, sentences, sage_ctx)
                     answers: dict[str, L.Answer] = {}
-                    if built.requests:
-                        try:
-                            response = await self.sage.decide_batch(built.requests)
-                            raw, errors = L.parse_batch(response)
-                            answers = {built.qid_to_key.get(q, q): a for q, a in raw.items()}
-                            report["usage"] = (response.get("meta") or {}).get("usage")
-                            if errors:
-                                report["errors"].append(f"post_turn answers: {errors}")
-                        except SageError as exc:
-                            report["errors"].append(f"post_turn: {exc}")
+                    # Memory + pacing and the competency evaluation run at the same time.
+                    response, evaluated = await asyncio.gather(
+                        self.sage.decide_batch(built.requests) if built.requests else _nothing(),
+                        self._evaluate(db, ctx, user_msg, report),
+                        return_exceptions=True,
+                    )
+                    if isinstance(evaluated, BaseException):
+                        raise evaluated
+                    if isinstance(response, SageError):
+                        report["errors"].append(f"post_turn: {response}")
+                    elif isinstance(response, BaseException):
+                        raise response
+                    elif response is not None:
+                        raw, errors = L.parse_batch(response)
+                        answers = {built.qid_to_key.get(q, q): a for q, a in raw.items()}
+                        report["usage"] = (response.get("meta") or {}).get("usage")
+                        if errors:
+                            report["errors"].append(f"post_turn answers: {errors}")
                     kind_spec = BY_KEY["memory.kind"]
                     all_ids = {c.id for c in ctx.characters}
                     for index, sentence in enumerate(sentences):
@@ -486,6 +644,41 @@ class Harness:
             report["errors"].append(f"post_turn crashed: {exc}")
         return report
 
+    async def _evaluate(self, db: Session, ctx: TurnContext, user_msg: Message, report: dict[str, Any]) -> None:
+        """Sage scores the trainee message on each scenario competency, with evidence sentences.
+        The scores are stored, never shown to the narrator, and only counts go to the stream."""
+        items = ctx.competencies
+        if not items:
+            return
+        earlier = [m for m in ctx.messages if m.turn_index < user_msg.turn_index][-12:]
+        sentences = sentence_spans(user_msg.content)
+        built = build_evaluation(evaluation_view(earlier, user_msg, ctx.persona_name), items, ctx.persona_name, sentences)
+        error: str | None = None
+        answers: dict[str, L.Answer] = {}
+        try:
+            response = await self.sage.decide_batch(built.requests, ctx.preset.evaluation_reasoning)
+            raw, errors = L.parse_batch(response)
+            answers = {built.qid_to_key.get(q, q): a for q, a in raw.items()}
+            report["evaluation_usage"] = (response.get("meta") or {}).get("usage")
+            if errors:
+                report["errors"].append(f"evaluation answers: {errors}")
+        except SageError as exc:
+            error = str(exc)
+
+        # Regenerate evaluates the same message again: replace Sage rows, keep manager corrections.
+        corrected: set[int] = set()
+        for row in db.exec(select(Evaluation).where(Evaluation.message_id == user_msg.id)):
+            if row.source == "manager":
+                corrected.add(row.competency_id)
+            else:
+                db.delete(row)
+        rows = [r for r in to_evaluations(answers, sentences, items, user_msg, error) if r.competency_id not in corrected]
+        db.add_all(rows)
+        db.commit()
+        report["evaluation"] = {"competencies": len(rows), "needs_review": sum(r.needs_review for r in rows)}
+        if error:
+            report["errors"].append(f"evaluation: {error}")
+
     async def _extract_location(self, labels: L.LabelSet, turn_text: str, persona_name: str, turn: int, report: dict[str, Any]) -> None:
         """Sage Extract finds the place name when the scene moved somewhere not in the lorebook."""
         label = labels.get("scene.location")
@@ -529,7 +722,7 @@ class Harness:
             if call_sage:
                 state = await self.pre_turn(ctx, history)
             else:
-                labels = L.LabelSet.from_json(ctx.session.labels) if ctx.session.labels else initial_labels(ctx.characters)
+                labels = L.LabelSet.from_json(ctx.session.labels) if ctx.session.labels else initial_labels(ctx.characters, ctx.state_variables)
                 activation = activate(ctx.lore, [m.content for m in history], draft.turn_index, ctx.session.lore_timers, labels.value("scene.location"), self.rng)
                 kept, dropped = apply_budget(finalize(activation, None), int(ctx.preset.context_size * ctx.preset.lore_budget_pct / 100))
                 memory = rank_memory(ctx.memory, ctx.characters, labels.value("scene.present", []), user_text)[:DEGRADED_MEMORY_COUNT]
