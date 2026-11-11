@@ -381,7 +381,7 @@ export interface ResultsTable {
 export type TurnEvent =
   | { event: 'harness'; data: { state: HarnessStatePublic; prompt: PromptPublic | null; user_message_id?: number } }
   | { event: 'token'; data: { text: string } }
-  | { event: 'done'; data: { message_id: number; user_message_id: number; usage?: Record<string, number>; end_reason: EndReason } }
+  | { event: 'done'; data: { message_id: number; user_message_id: number; turn_count: number; usage?: Record<string, number>; end_reason: EndReason } }
   | { event: 'post_turn'; data: PostTurnReport }
   | { event: 'blocked'; data: { message_id: number; reason: string } }
   | { event: 'error'; data: { message: string } }

@@ -51,6 +51,8 @@ export default function Play() {
   const [pendingUser, setPendingUser] = useState<string | null>(null)
   const [streaming, setStreaming] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  // The reply is saved ("done"): Stop no longer applies, the evaluation finishes on the server.
+  const [answered, setAnswered] = useState(false)
   const [ending, setEnding] = useState(false)
   const [phase, setPhase] = useState<MessageKey | ''>('')
   const [error, setError] = useState('')
@@ -130,11 +132,13 @@ export default function Play() {
         setStreaming((s) => (s ?? '') + event.data.text)
         break
       case 'done':
+        setAnswered(true)
         setPhase('Sage is updating the state and the evaluation…')
         setEndReason(event.data.end_reason)
         loadMessages().then(() => {
           setStreaming(null)
           setPendingUser(null)
+          setSession((s) => (s ? { ...s, turn_count: event.data.turn_count } : s))
         })
         break
       case 'post_turn':
@@ -153,24 +157,33 @@ export default function Play() {
     }
   }
 
-  const run = async (path: string, body: unknown) => {
+  /** Runs one turn. Returns true when the counterpart reply was saved. */
+  const run = async (path: string, body: unknown): Promise<boolean> => {
+    let saved = false
     setBusy(true)
+    setAnswered(false)
     setError('')
     setNotice('')
     setReport(null)
     setPhase('Sage is reading the conversation…')
     abort.current = new AbortController()
     try {
-      await streamTurn(path, body, handleEvent, abort.current.signal)
+      await streamTurn(path, body, (event) => {
+        if (event.event === 'done') saved = true
+        handleEvent(event)
+      }, abort.current.signal)
     } catch (e) {
       if ((e as Error).name !== 'AbortError') setError(String(e))
     } finally {
-      await loadMessages()
+      // A failed or stopped turn is undone on the server; reload what is really saved.
+      await Promise.all([loadMessages(), api.get<RpSession>(`/sessions/${sessionId}`).then(setSession).catch(() => undefined)])
       setStreaming(null)
       setPendingUser(null)
       setBusy(false)
+      setAnswered(false)
       setPhase('')
     }
+    return saved
   }
 
   const send = async () => {
@@ -178,7 +191,9 @@ export default function Play() {
     if (!text || busy) return
     setInput('')
     setPendingUser(text)
-    await run(`/sessions/${sessionId}/turn`, { text })
+    const saved = await run(`/sessions/${sessionId}/turn`, { text })
+    // Not counted (error, empty reply, Stop, blocked): give the text back to change or send again.
+    if (!saved) setInput((current) => current || text)
   }
 
   const regenerate = () => run(`/sessions/${sessionId}/regenerate`, {})
@@ -316,7 +331,7 @@ export default function Play() {
           />
           <div className="stack" style={{ gap: 6 }}>
             {busy ? (
-              <button onClick={() => abort.current?.abort()}>{t('Stop')}</button>
+              <button disabled={answered} onClick={() => abort.current?.abort()}>{t('Stop')}</button>
             ) : (
               <button className="primary" onClick={send} disabled={!input.trim() || completed}>{t('Send')}</button>
             )}

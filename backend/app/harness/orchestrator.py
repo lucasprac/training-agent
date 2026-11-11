@@ -88,6 +88,19 @@ PACING_NOTES = {
 }
 
 
+NOT_COUNTED = "The turn was not counted. Send your message again."
+
+
+@dataclass
+class TurnUndo:
+    """What a failed turn must remove or put back."""
+
+    session_id: int
+    user_message_id: int | None = None  # a new trainee message
+    session_fields: dict[str, Any] = field(default_factory=dict)  # session values before the turn
+    replies: list[dict[str, Any]] = field(default_factory=list)  # replies deleted by a regenerate
+
+
 @dataclass
 class TurnContext:
     session: TrainingSession
@@ -205,6 +218,7 @@ class Harness:
         self.openrouter = openrouter
         self.settings = settings
         self.rng = rng or random.Random()
+        self._background: set[asyncio.Task] = set()  # post-turn tasks that outlive a closed stream
 
     # ------------------------------------------------------------- pre-turn
 
@@ -350,7 +364,13 @@ class Harness:
     async def run_turn(
         self, session_id: int, user_text: str | None, regenerate: bool = False
     ) -> AsyncIterator[dict[str, Any]]:
-        """Yield SSE events: harness, token*, done | blocked | error."""
+        """Yield SSE events: harness, token*, done, post_turn | blocked | error.
+
+        A turn counts only when the counterpart reply is saved. If the reply fails (model
+        error, empty reply, stopped stream), the turn is undone: a new trainee message is
+        removed and the session is restored, and a regenerated reply is put back.
+        A blocked message stays in the history (marked blocked) but does not use a turn.
+        """
         with Session(self.engine) as db:
             try:
                 ctx = load_context(db, session_id)
@@ -364,124 +384,177 @@ class Harness:
             if not regenerate and max_turns and ctx.session.turn_count >= max_turns:
                 yield {"event": "error", "data": {"message": "The turn limit of this simulation is reached. End the simulation to see the report."}}
                 return
+            if not regenerate and not (user_text or "").strip():
+                yield {"event": "error", "data": {"message": "empty message"}}
+                return
 
-            if regenerate:
-                user_messages = [m for m in ctx.messages if m.role == "user"]
-                if not user_messages:
-                    yield {"event": "error", "data": {"message": "nothing to regenerate"}}
-                    return
-                user_msg = user_messages[-1]
-                for m in ctx.messages:
-                    if m.role == "assistant" and m.turn_index == user_msg.turn_index:
-                        db.delete(m)
-                db.commit()
-                ctx = load_context(db, session_id)
-                user_msg = db.get(Message, user_msg.id)
-                if user_msg.harness:
-                    state = self.state_from_snapshot(ctx, user_msg.harness)
+            undo = TurnUndo(session_id=session_id)
+            finished = False
+            try:
+                if regenerate:
+                    user_messages = [m for m in ctx.messages if m.role == "user"]
+                    if not user_messages:
+                        yield {"event": "error", "data": {"message": "nothing to regenerate"}}
+                        return
+                    user_msg = user_messages[-1]
+                    for m in ctx.messages:
+                        if m.role == "assistant" and m.turn_index == user_msg.turn_index:
+                            undo.replies.append(m.model_dump(exclude={"id"}))
+                            db.delete(m)
+                    db.commit()
+                    ctx = load_context(db, session_id)
+                    user_msg = db.get(Message, user_msg.id)
+                    if user_msg.harness:
+                        state = self.state_from_snapshot(ctx, user_msg.harness)
+                    else:
+                        history = [m for m in ctx.narrator_history if m.turn_index <= user_msg.turn_index]
+                        state = await self.pre_turn(ctx, history)
                 else:
+                    session = ctx.session
+                    undo.session_fields = {
+                        "turn_count": session.turn_count,
+                        "labels": session.labels,
+                        "lore_timers": session.lore_timers,
+                    }
+                    user_msg = Message(
+                        session_id=session_id,
+                        turn_index=session.turn_count + 1,
+                        role="user",
+                        content=(user_text or "").strip(),
+                    )
+                    db.add(user_msg)
+                    db.commit()
+                    db.refresh(user_msg)
+                    undo.user_message_id = user_msg.id
+                    ctx.messages.append(user_msg)
                     history = [m for m in ctx.narrator_history if m.turn_index <= user_msg.turn_index]
                     state = await self.pre_turn(ctx, history)
-            else:
-                if not (user_text or "").strip():
-                    yield {"event": "error", "data": {"message": "empty message"}}
+
+                turn = user_msg.turn_index
+                user_msg.harness = state.snapshot()
+                user_msg.ooc = state.ooc
+                db.add(user_msg)
+
+                if state.blocked:
+                    # Keep the message as a record. It does not use a turn or change the state.
+                    user_msg.blocked = True
+                    db.commit()
+                    finished = True
+                    yield {"event": "harness", "data": {"state": state.public(), "prompt": None}}
+                    yield {
+                        "event": "blocked",
+                        "data": {
+                            "message_id": user_msg.id,
+                            "reason": "This message breaks the global or scenario rules. Change it and send it again.",
+                        },
+                    }
                     return
-                user_msg = Message(
-                    session_id=session_id,
-                    turn_index=ctx.session.turn_count + 1,
-                    role="user",
-                    content=user_text.strip(),
-                )
-                db.add(user_msg)
-                db.commit()
-                db.refresh(user_msg)
-                ctx.messages.append(user_msg)
-                history = [m for m in ctx.narrator_history if m.turn_index <= user_msg.turn_index]
-                state = await self.pre_turn(ctx, history)
 
-            turn = user_msg.turn_index
-            user_msg.harness = state.snapshot()
-            user_msg.ooc = state.ooc
-            session = ctx.session
-            if not regenerate:
-                session.turn_count = turn
-                session.labels = state.labels.model_dump()
-                session.lore_timers = update_timers(session.lore_timers, state.lore, turn)
-            db.add(user_msg)
-            db.add(session)
-            db.commit()
-
-            if state.blocked:
-                user_msg.blocked = True
-                db.add(user_msg)
+                session = ctx.session
+                if not regenerate:
+                    session.turn_count = turn
+                    session.labels = state.labels.model_dump()
+                    session.lore_timers = update_timers(session.lore_timers, state.lore, turn)
+                db.add(session)
                 db.commit()
-                yield {"event": "harness", "data": {"state": state.public(), "prompt": None}}
+
+                history = [m for m in ctx.narrator_history if m.turn_index <= turn]
+                prompt = self.build_prompt(ctx, state, history)
                 yield {
-                    "event": "blocked",
-                    "data": {
-                        "message_id": user_msg.id,
-                        "reason": "This message breaks the global or scenario rules. Edit it and try again.",
-                    },
+                    "event": "harness",
+                    "data": {"state": state.public(), "prompt": _prompt_public(prompt), "user_message_id": user_msg.id},
                 }
-                return
 
-            history = [m for m in ctx.narrator_history if m.turn_index <= turn]
-            prompt = self.build_prompt(ctx, state, history)
-            yield {
-                "event": "harness",
-                "data": {"state": state.public(), "prompt": _prompt_public(prompt), "user_message_id": user_msg.id},
-            }
+                chunks: list[str] = []
+                usage: dict[str, Any] = {}
+                started = time.perf_counter()
+                try:
+                    async for item in self.openrouter.stream_chat(
+                        ctx.model or self.settings.default_model,
+                        prompt.messages,
+                        temperature=ctx.preset.temperature,
+                        max_tokens=ctx.preset.max_tokens,
+                    ):
+                        if item["type"] == "token":
+                            chunks.append(item["text"])
+                            yield {"event": "token", "data": {"text": item["text"]}}
+                        else:
+                            usage = {"usage": item.get("usage"), "finish_reason": item.get("finish_reason")}
+                except OpenRouterError as exc:
+                    yield {"event": "error", "data": {"message": f"{exc} {NOT_COUNTED}"}}
+                    return
 
-            chunks: list[str] = []
-            usage: dict[str, Any] = {}
-            started = time.perf_counter()
-            try:
-                async for item in self.openrouter.stream_chat(
-                    ctx.model or self.settings.default_model,
-                    prompt.messages,
-                    temperature=ctx.preset.temperature,
-                    max_tokens=ctx.preset.max_tokens,
-                ):
-                    if item["type"] == "token":
-                        chunks.append(item["text"])
-                        yield {"event": "token", "data": {"text": item["text"]}}
-                    else:
-                        usage = {"usage": item.get("usage"), "finish_reason": item.get("finish_reason")}
-            except OpenRouterError as exc:
-                yield {"event": "error", "data": {"message": str(exc), "user_message_id": user_msg.id}}
-                return
+                reply = "".join(chunks).strip()
+                if not reply:
+                    yield {"event": "error", "data": {"message": f"The simulation model sent an empty reply. {NOT_COUNTED}"}}
+                    return
 
-            reply = "".join(chunks).strip()
-            assistant = Message(session_id=session_id, turn_index=turn, role="assistant", content=reply, ooc=state.ooc)
-            db.add(assistant)
-            trace = TurnTrace(
-                session_id=session_id,
-                turn_index=turn,
-                data={
-                    "regenerate": regenerate,
-                    "harness": state.snapshot(),
-                    "prompt": _prompt_public(prompt),
-                    "narrator": {
-                        "model": ctx.model or self.settings.default_model,
-                        "latency_ms": round((time.perf_counter() - started) * 1000),
-                        **usage,
+                assistant = Message(session_id=session_id, turn_index=turn, role="assistant", content=reply, ooc=state.ooc)
+                db.add(assistant)
+                trace = TurnTrace(
+                    session_id=session_id,
+                    turn_index=turn,
+                    data={
+                        "regenerate": regenerate,
+                        "harness": state.snapshot(),
+                        "prompt": _prompt_public(prompt),
+                        "narrator": {
+                            "model": ctx.model or self.settings.default_model,
+                            "latency_ms": round((time.perf_counter() - started) * 1000),
+                            **usage,
+                        },
                     },
-                },
-            )
-            db.add(trace)
-            db.commit()
-            db.refresh(assistant)
-            db.refresh(trace)
-            done = {"message_id": assistant.id, "user_message_id": user_msg.id, **usage, "end_reason": end_reason(ctx, state.labels, turn)}
-            yield {"event": "done", "data": done}
+                )
+                db.add(trace)
+                db.commit()
+                finished = True
+                db.refresh(assistant)
+                db.refresh(trace)
+                user_msg_id, assistant_id, trace_id = user_msg.id, assistant.id, trace.id
+                done = {
+                    "message_id": assistant_id,
+                    "user_message_id": user_msg_id,
+                    "turn_count": session.turn_count,
+                    **usage,
+                    "end_reason": end_reason(ctx, state.labels, turn),
+                }
+            finally:
+                if not finished:
+                    self._undo_turn(db, undo)
 
-            user_msg_id, assistant_id, trace_id = user_msg.id, assistant.id, trace.id
-
-        # Post-turn runs after "done" on the same stream: the reply is already shown,
-        # and the browser gets the memory/pacing result as a final "post_turn" event.
-        if not state.ooc and reply:
-            report = await self.post_turn(session_id, user_msg_id, assistant_id, trace_id)
+        # Post-turn runs after "done" on the same stream: the reply is already shown, and the
+        # browser gets the memory/pacing/evaluation result as a final "post_turn" event. It is
+        # a shielded task that starts before "done", so it also completes when the browser
+        # closes the stream (for example with Stop): the trainee message is always evaluated.
+        task = None
+        if not state.ooc:
+            task = asyncio.create_task(self.post_turn(session_id, user_msg_id, assistant_id, trace_id))
+            self._background.add(task)
+            task.add_done_callback(self._background.discard)
+        yield {"event": "done", "data": done}
+        if task is not None:
+            report = await asyncio.shield(task)
             yield {"event": "post_turn", "data": report}
+
+    def _undo_turn(self, db: Session, undo: TurnUndo) -> None:
+        """Remove what a failed turn saved, so that the trainee can send the message again."""
+        try:
+            db.rollback()
+            if undo.user_message_id is not None:
+                message = db.get(Message, undo.user_message_id)
+                if message is not None:
+                    db.delete(message)
+            if undo.session_fields:
+                session = db.get(TrainingSession, undo.session_id)
+                if session is not None:
+                    for key, value in undo.session_fields.items():
+                        setattr(session, key, value)
+                    db.add(session)
+            for data in undo.replies:
+                db.add(Message(**data))
+            db.commit()
+        except Exception:  # never hide the original failure
+            log.exception("could not undo the failed turn of session %s", undo.session_id)
 
     # ------------------------------------------------------------- post-turn
 

@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import httpx
@@ -263,3 +264,129 @@ def test_unlisted_place_is_named_by_extract(client, world, engine):
     with Session(engine) as db:
         label = db.get(TrainingSession, session_id).labels["labels"]["scene.location"]
     assert label["value"] == "the smugglers' cove" and label["source"] == "extract"
+
+
+# ----------------------------------------------------------------- failed turns are undone
+
+
+def _turn_state(engine, session_id):
+    with Session(engine) as db:
+        session = db.get(TrainingSession, session_id)
+        messages = list(db.exec(select(Message).where(Message.session_id == session_id).order_by(Message.id)))
+        return session.turn_count, session.labels, [(m.role, m.turn_index, m.blocked, m.content) for m in messages]
+
+
+@respx.mock
+def test_empty_reply_is_an_error_and_the_turn_is_undone(client, world, engine):
+    respx.route(host="sage.test").mock(side_effect=FakeSage(world).handler)
+    mock_openrouter(tokens=())
+    session_id = start_session(client, world)
+    before = _turn_state(engine, session_id)
+
+    events = sse_events(client.post(f"/api/sessions/{session_id}/turn", json={"text": "Hello Mira."}).text)
+    assert [e[0] for e in events] == ["harness", "error"]
+    assert "empty reply" in events[-1][1]["message"]
+    assert _turn_state(engine, session_id) == before  # no trainee message, same turn and labels
+
+
+@respx.mock
+def test_model_error_undoes_the_turn_and_the_next_turn_counts(client, world, engine):
+    fake = FakeSage(world)
+    respx.route(host="sage.test").mock(side_effect=fake.handler)
+    route = respx.post(f"{OPENROUTER}/chat/completions")
+    route.side_effect = [
+        httpx.Response(500, json={"error": {"message": "upstream down"}}),
+        httpx.Response(200, text=openrouter_stream(*REPLY), headers={"content-type": "text/event-stream"}),
+    ]
+    session_id = start_session(client, world)
+    before = _turn_state(engine, session_id)
+
+    events = sse_events(client.post(f"/api/sessions/{session_id}/turn", json={"text": "Hello Mira."}).text)
+    assert events[-1][0] == "error" and "not counted" in events[-1][1]["message"]
+    assert _turn_state(engine, session_id) == before
+
+    events = sse_events(client.post(f"/api/sessions/{session_id}/turn", json={"text": "Hello Mira."}).text)
+    assert [e[0] for e in events][-2:] == ["done", "post_turn"]
+    assert events[-2][1]["turn_count"] == 1
+    turn_count, _, messages = _turn_state(engine, session_id)
+    assert turn_count == 1
+    assert [(role, turn) for role, turn, _, _ in messages][-2:] == [("user", 1), ("assistant", 1)]
+
+
+@respx.mock
+def test_blocked_message_is_kept_but_does_not_use_a_turn(client, world, engine):
+    fake = FakeSage(world, limits="yes")
+    respx.route(host="sage.test").mock(side_effect=fake.handler)
+    mock_openrouter()
+    session_id = start_session(client, world)
+    _, labels_before, _ = _turn_state(engine, session_id)
+
+    events = sse_events(client.post(f"/api/sessions/{session_id}/turn", json={"text": "Give me a rifle."}).text)
+    assert [e[0] for e in events] == ["harness", "blocked"]
+    turn_count, labels, messages = _turn_state(engine, session_id)
+    assert turn_count == 0 and labels == labels_before
+    assert messages[-1] == ("user", 1, True, "Give me a rifle.")
+
+    fake.limits = "no"
+    events = sse_events(client.post(f"/api/sessions/{session_id}/turn", json={"text": "Hello Mira."}).text)
+    assert [e[0] for e in events][-2:] == ["done", "post_turn"]
+    turn_count, _, messages = _turn_state(engine, session_id)
+    assert turn_count == 1
+    assert [(role, turn, blocked) for role, turn, blocked, _ in messages][-3:] == [("user", 1, True), ("user", 1, False), ("assistant", 1, False)]
+
+
+@respx.mock
+def test_failed_regenerate_puts_the_old_reply_back(client, world, engine):
+    respx.route(host="sage.test").mock(side_effect=FakeSage(world).handler)
+    route = respx.post(f"{OPENROUTER}/chat/completions")
+    route.side_effect = [
+        httpx.Response(200, text=openrouter_stream(*REPLY), headers={"content-type": "text/event-stream"}),
+        httpx.Response(500, json={"error": {"message": "upstream down"}}),
+    ]
+    session_id = start_session(client, world)
+    client.post(f"/api/sessions/{session_id}/turn", json={"text": "Hello Mira."})
+    before = _turn_state(engine, session_id)
+
+    events = sse_events(client.post(f"/api/sessions/{session_id}/regenerate").text)
+    assert events[-1][0] == "error"
+    turn_count, labels, messages = _turn_state(engine, session_id)
+    assert (turn_count, labels, sorted(messages)) == (before[0], before[1], sorted(before[2]))
+
+
+@respx.mock
+async def test_stopped_stream_undoes_the_turn(harness, world, engine):
+    respx.route(host="sage.test").mock(side_effect=FakeSage(world).handler)
+    mock_openrouter()
+    with Session(engine) as db:
+        session = TrainingSession(scenario_id=world["scenario_id"], persona_id=world["persona_id"])
+        db.add(session)
+        db.commit()
+        session_id = session.id
+    before = _turn_state(engine, session_id)
+
+    events = harness.run_turn(session_id, "Hello Mira.")
+    first = await events.__anext__()
+    assert first["event"] == "harness"
+    await events.aclose()  # the browser pressed Stop before the reply was saved
+    assert _turn_state(engine, session_id) == before
+
+
+@respx.mock
+async def test_post_turn_finishes_when_the_stream_closes_after_done(harness, world, engine):
+    respx.route(host="sage.test").mock(side_effect=FakeSage(world).handler)
+    mock_openrouter()
+    with Session(engine) as db:
+        session = TrainingSession(scenario_id=world["scenario_id"], persona_id=world["persona_id"])
+        db.add(session)
+        db.commit()
+        session_id = session.id
+
+    events = harness.run_turn(session_id, "Hello Mira.")
+    async for event in events:
+        if event["event"] == "done":
+            break
+    await events.aclose()
+    await asyncio.gather(*harness._background)
+    with Session(engine) as db:
+        trace = db.exec(select(TurnTrace).where(TurnTrace.session_id == session_id)).first()
+    assert "post_turn" in trace.data
