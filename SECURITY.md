@@ -16,5 +16,5 @@ Login and access control are on the [roadmap](README.md#roadmap).
 Do not open a public issue for a security problem.
 
 1. Open the **Security** tab of this repository.
-2. If the tab shows **Report a vulnerability**, use it to send a private report. Include the steps to reproduce the problem and the commit that you tested.
-3. If the tab does not show this button, open an issue that asks for a private contact. Do not put the details of the problem in the issue.
+2. Click **Report a vulnerability** and send a private report.
+3. Include the steps to reproduce the problem and the commit that you tested.
