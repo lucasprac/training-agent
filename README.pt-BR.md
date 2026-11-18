@@ -39,7 +39,7 @@ A avaliação e a encenação ficam separadas:
 - Um modelo do **[OpenRouter](https://openrouter.ai)** interpreta os interlocutores e escreve o feedback final. Ele nunca vê as notas e nunca as altera.
 
 > [!NOTE]
-> O Training Agent é um protótipo. Os perfis não têm login, e qualquer pessoa pode trocar de perfil. Use em demonstrações e pilotos, não com dados reais de colaboradores. Veja [SECURITY.md](SECURITY.md).
+> O Training Agent é um protótipo. Os perfis não têm login, e qualquer pessoa pode trocar de perfil. Use só em protótipos e demonstrações, não com dados reais de colaboradores. Veja [SECURITY.md](SECURITY.md).
 
 ## Recursos
 
@@ -53,7 +53,8 @@ A avaliação e a encenação ficam separadas:
 - **Biblioteca de competências** com comportamentos observáveis (a mostrar e a evitar) e níveis de rubrica.
 - **Atribuição** de cenários aos colaboradores, com prazo opcional.
 - **Inspetor** para testar um cenário: harness, estado, avaliação, prompt, memória e rótulos de cada turno.
-- **Tabela de resultados** por colaborador e por competência, e uma fila de revisão para as notas que o Sage não conseguiu decidir.
+- **Tabela de resultados** por colaborador e por competência.
+- **Revisão manual**: quando o Sage não consegue decidir uma nota, o gestor define o nível na página do relatório.
 
 </td>
 <td width="50%" valign="top">

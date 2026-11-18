@@ -1,6 +1,6 @@
 # Contributing to Training Agent
 
-Thank you for your interest in the project. This guide tells you how to set up the project, run the checks and open a pull request.
+Thank you for your interest in the project. This guide tells you how to prepare the project, run the checks and open a pull request.
 
 ## Before you start
 
@@ -8,7 +8,7 @@ Thank you for your interest in the project. This guide tells you how to set up t
 - For a new feature, [open a feature request](https://github.com/lucasprac/training-agent/issues/new?template=feature_request.yml) first. Agree on the idea before you write a large change.
 - For a security problem, read [SECURITY.md](SECURITY.md). Do not open a public issue.
 
-## Set up the project
+## Prepare the project
 
 Follow the [Quickstart](README.md#quickstart). The tests do not need API keys, because they mock Sage and OpenRouter.
 
@@ -38,7 +38,7 @@ Follow the [Quickstart](README.md#quickstart). The tests do not need API keys, b
 
 ## Open a pull request
 
-- Fill in the pull request template.
+- Complete the pull request template.
 - Describe what changed and why.
 - Add screenshots for interface changes.
 - The CI runs the backend tests, the frontend lint and the frontend build. All of them must pass.

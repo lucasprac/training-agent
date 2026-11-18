@@ -16,9 +16,10 @@ Edit `banner.html`, then render it with headless Chrome. Run the commands from t
 ```bash
 CHROME="/c/Program Files/Google/Chrome/Application/chrome.exe"
 SRC="file:///$(pwd -W)/docs/assets/src/banner.html"
-"$CHROME" --headless=new --hide-scrollbars --allow-file-access-from-files --window-size=1280,420 --force-device-scale-factor=2 --screenshot="docs/assets/banner-light.png" "$SRC?theme=light&size=banner"
-"$CHROME" --headless=new --hide-scrollbars --allow-file-access-from-files --window-size=1280,420 --force-device-scale-factor=2 --screenshot="docs/assets/banner-dark.png" "$SRC?theme=dark&size=banner"
-"$CHROME" --headless=new --hide-scrollbars --allow-file-access-from-files --window-size=1280,640 --force-device-scale-factor=1 --screenshot="docs/assets/social-preview.png" "$SRC?theme=light&size=social"
+"$CHROME" --headless=new --hide-scrollbars --allow-file-access-from-files --user-data-dir="$(pwd -W)/.chrome-tmp" --window-size=1280,420 --force-device-scale-factor=2 --virtual-time-budget=3000 --screenshot="$(pwd -W)/docs/assets/banner-light.png" "$SRC?theme=light&size=banner"
+"$CHROME" --headless=new --hide-scrollbars --allow-file-access-from-files --user-data-dir="$(pwd -W)/.chrome-tmp" --window-size=1280,420 --force-device-scale-factor=2 --virtual-time-budget=3000 --screenshot="$(pwd -W)/docs/assets/banner-dark.png" "$SRC?theme=dark&size=banner"
+"$CHROME" --headless=new --hide-scrollbars --allow-file-access-from-files --user-data-dir="$(pwd -W)/.chrome-tmp" --window-size=1280,640 --force-device-scale-factor=1 --virtual-time-budget=3000 --screenshot="$(pwd -W)/docs/assets/social-preview.png" "$SRC?theme=light&size=social"
+rm -rf .chrome-tmp
 ```
 
 The screenshots come from the running app with the sample data (`SAMPLE_DATA=true`) and one finished session.

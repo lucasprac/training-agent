@@ -39,7 +39,7 @@ The scoring and the role-play are kept apart:
 - An **[OpenRouter](https://openrouter.ai)** model plays the counterparts and writes the final feedback text. It never sees the scores, and it never changes them.
 
 > [!NOTE]
-> Training Agent is a prototype. Profiles have no login, and anyone can switch profiles. Use it for demos and pilots, not with real employee data. See [SECURITY.md](SECURITY.md).
+> Training Agent is a prototype. Profiles have no login, and anyone can switch profiles. Use it for prototypes and demos only, not with real employee data. See [SECURITY.md](SECURITY.md).
 
 ## Features
 
@@ -53,7 +53,8 @@ The scoring and the role-play are kept apart:
 - **Competency library** with observable behaviours (to show and to avoid) and rubric levels.
 - **Assignments** to trainees, with an optional due date.
 - **Inspector** to test a scenario: harness, state, evaluation, prompt, memory and labels for each turn.
-- **Results table** per trainee and per competency, and a review queue for scores that Sage could not decide.
+- **Results table** per trainee and per competency.
+- **Manual review**: when Sage cannot decide a score, the manager sets the level on the report page.
 
 </td>
 <td width="50%" valign="top">
