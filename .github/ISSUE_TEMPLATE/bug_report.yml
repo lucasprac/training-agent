@@ -1,0 +1,58 @@
+name: Bug report
+description: Something does not work as described.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Thank you for the report. Do not paste API keys or real employee data.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Tell us what you saw and what you expected to see.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open the scenario editor as the manager.
+        2. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Simulation (chat, counterparts)
+        - Evaluation or report
+        - Scenario editor
+        - Competency library
+        - Team, assignments or results
+        - Prompt manager or settings
+        - Setup or installation
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: keys
+    attributes:
+      label: Which API keys are set?
+      options:
+        - Sage and OpenRouter
+        - Only OpenRouter (degraded mode)
+        - Only Sage
+        - None
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      description: Backend output, browser console errors or screenshots.
+      render: shell
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: "OS, browser, Python and Node versions, commit"

@@ -1,10 +1,11 @@
+import asyncio
 import json
 
 import httpx
 import respx
 from sqlmodel import Session, select
 
-from app.models import MemoryItem, Message, RoleplaySession, TurnTrace
+from app.models import MemoryItem, Message, TrainingSession, TurnTrace
 from tests.conftest import OPENROUTER, SAGE, make_harness, openrouter_stream, sse_events
 
 
@@ -40,10 +41,10 @@ class FakeSage:
             result = {"answer": self.limits, "probability": 0.97 if self.limits == "yes" else 0.02}
         elif qid == "scene_location":
             result = {"chosen": self.location, "probability": 0.91}
-        elif qid == "scene_type":
-            result = {"chosen": "dialogue", "probability": 0.8}
-        elif qid == "scene_mood":
-            result = {"chosen": "tense", "probability": 0.86}
+        elif qid == "scene_stage":
+            result = {"chosen": "discovery", "probability": 0.8}
+        elif qid == "scene_tone":
+            result = {"chosen": "frustrated", "probability": 0.86}
         elif qid == "scene_present":
             result = self._tags(question, lambda t: t["id"] == mira)
         elif qid == "select_lore":
@@ -116,7 +117,7 @@ def test_full_turn_stream_memory_and_veil(client, harness, world, engine):
     sent = json.loads(narrator.calls.last.request.content)
     assert sent["model"] == "test/narrator" and sent["stream"] is True
     system = sent["messages"][0]["content"]
-    assert "<global_rules>" in system and "The veil of knowledge" in system and "Total immersion" in system
+    assert "<global_rules>" in system and "The veil of knowledge" in system and "No coaching" in system
     assert sent["messages"][-1]["content"].startswith("<post_history>")
     assert any(m["content"].startswith("<scene ") for m in sent["messages"])
     assert "probability" not in json.dumps(sent["messages"])
@@ -128,12 +129,12 @@ def test_full_turn_stream_memory_and_veil(client, harness, world, engine):
     assert report["sentences_checked"] == 3  # user sentence + 2 reply sentences
     with Session(engine) as db:
         items = list(db.exec(select(MemoryItem).where(MemoryItem.session_id == session_id)))
-        session = db.get(RoleplaySession, session_id)
+        session = db.get(TrainingSession, session_id)
         traces = list(db.exec(select(TurnTrace)))
     # Only the sentence Sage classified (item) became memory; Mira witnessed it.
     assert [(i.kind, i.content, i.known_by) for i in items] == [("item", "Mira slides a brass key across the table.", [world["mira"]])]
     assert fake.extracts == []  # location is known (Neon Harbor): no Extract call
-    assert session.pacing_note.startswith("Pacing: the scene is stalling")
+    assert session.pacing_note.startswith("Pacing: the conversation is stalling")
     assert traces and "post_turn" in traces[0].data
 
 
@@ -237,25 +238,16 @@ def test_label_lock_is_respected(client, world):
     assert client.patch(f"/api/sessions/{session_id}/labels", json={"key": "select.lore", "value": [], "locked": True}).status_code == 400
 
 
-def test_crud_preset_rules_and_import(client):
+def test_crud_preset_and_rules(client):
     preset = client.get("/api/preset").json()
     assert preset["block_order"][-1]["id"] == "post_history"
     rules = client.get("/api/rules").json()
-    assert [r["title"] for r in rules][:2] == ["Total immersion", "The veil of knowledge"]
+    assert [r["title"] for r in rules][:2] == ["Realism", "The veil of knowledge"]
     # Required blocks cannot be disabled.
     order = [dict(b, enabled=False) for b in preset["block_order"]]
     updated = client.put("/api/preset", json={"block_order": order}).json()
     assert next(b for b in updated["block_order"] if b["id"] == "global_rules")["enabled"] is True
 
-    card = {"spec": "chara_card_v2", "data": {"name": "Vex", "description": "A thief.", "first_mes": "Hi {{user}}.", "scenario": "Alleys.",
-            "character_book": {"entries": [{"keys": ["alley"], "content": "Dark alleys.", "comment": "Alleys", "insertion_order": 10}]}}}
-    response = client.post("/api/import/card", files={"file": ("vex.json", json.dumps(card), "application/json")})
-    assert response.status_code == 200, response.text
-    scenario_id = response.json()["scenario"]["id"]
-    assert response.json()["lore_count"] == 1
-    assert client.get(f"/api/characters?scenario_id={scenario_id}").json()[0]["name"] == "Vex"
-    assert client.delete(f"/api/scenarios/{scenario_id}").json() == {"ok": True}
-    assert client.get(f"/api/lore?scenario_id={scenario_id}").json() == []
 
 
 @respx.mock
@@ -270,5 +262,131 @@ def test_unlisted_place_is_named_by_extract(client, world, engine):
     assert events[-1][1]["location"] == "the smugglers' cove"
     assert len(fake.extracts) == 1 and "place" in fake.extracts[0]["extract"]
     with Session(engine) as db:
-        label = db.get(RoleplaySession, session_id).labels["labels"]["scene.location"]
+        label = db.get(TrainingSession, session_id).labels["labels"]["scene.location"]
     assert label["value"] == "the smugglers' cove" and label["source"] == "extract"
+
+
+# ----------------------------------------------------------------- failed turns are undone
+
+
+def _turn_state(engine, session_id):
+    with Session(engine) as db:
+        session = db.get(TrainingSession, session_id)
+        messages = list(db.exec(select(Message).where(Message.session_id == session_id).order_by(Message.id)))
+        return session.turn_count, session.labels, [(m.role, m.turn_index, m.blocked, m.content) for m in messages]
+
+
+@respx.mock
+def test_empty_reply_is_an_error_and_the_turn_is_undone(client, world, engine):
+    respx.route(host="sage.test").mock(side_effect=FakeSage(world).handler)
+    mock_openrouter(tokens=())
+    session_id = start_session(client, world)
+    before = _turn_state(engine, session_id)
+
+    events = sse_events(client.post(f"/api/sessions/{session_id}/turn", json={"text": "Hello Mira."}).text)
+    assert [e[0] for e in events] == ["harness", "error"]
+    assert "empty reply" in events[-1][1]["message"]
+    assert _turn_state(engine, session_id) == before  # no trainee message, same turn and labels
+
+
+@respx.mock
+def test_model_error_undoes_the_turn_and_the_next_turn_counts(client, world, engine):
+    fake = FakeSage(world)
+    respx.route(host="sage.test").mock(side_effect=fake.handler)
+    route = respx.post(f"{OPENROUTER}/chat/completions")
+    route.side_effect = [
+        httpx.Response(500, json={"error": {"message": "upstream down"}}),
+        httpx.Response(200, text=openrouter_stream(*REPLY), headers={"content-type": "text/event-stream"}),
+    ]
+    session_id = start_session(client, world)
+    before = _turn_state(engine, session_id)
+
+    events = sse_events(client.post(f"/api/sessions/{session_id}/turn", json={"text": "Hello Mira."}).text)
+    assert events[-1][0] == "error" and "not counted" in events[-1][1]["message"]
+    assert _turn_state(engine, session_id) == before
+
+    events = sse_events(client.post(f"/api/sessions/{session_id}/turn", json={"text": "Hello Mira."}).text)
+    assert [e[0] for e in events][-2:] == ["done", "post_turn"]
+    assert events[-2][1]["turn_count"] == 1
+    turn_count, _, messages = _turn_state(engine, session_id)
+    assert turn_count == 1
+    assert [(role, turn) for role, turn, _, _ in messages][-2:] == [("user", 1), ("assistant", 1)]
+
+
+@respx.mock
+def test_blocked_message_is_kept_but_does_not_use_a_turn(client, world, engine):
+    fake = FakeSage(world, limits="yes")
+    respx.route(host="sage.test").mock(side_effect=fake.handler)
+    mock_openrouter()
+    session_id = start_session(client, world)
+    _, labels_before, _ = _turn_state(engine, session_id)
+
+    events = sse_events(client.post(f"/api/sessions/{session_id}/turn", json={"text": "Give me a rifle."}).text)
+    assert [e[0] for e in events] == ["harness", "blocked"]
+    turn_count, labels, messages = _turn_state(engine, session_id)
+    assert turn_count == 0 and labels == labels_before
+    assert messages[-1] == ("user", 1, True, "Give me a rifle.")
+
+    fake.limits = "no"
+    events = sse_events(client.post(f"/api/sessions/{session_id}/turn", json={"text": "Hello Mira."}).text)
+    assert [e[0] for e in events][-2:] == ["done", "post_turn"]
+    turn_count, _, messages = _turn_state(engine, session_id)
+    assert turn_count == 1
+    assert [(role, turn, blocked) for role, turn, blocked, _ in messages][-3:] == [("user", 1, True), ("user", 1, False), ("assistant", 1, False)]
+
+
+@respx.mock
+def test_failed_regenerate_puts_the_old_reply_back(client, world, engine):
+    respx.route(host="sage.test").mock(side_effect=FakeSage(world).handler)
+    route = respx.post(f"{OPENROUTER}/chat/completions")
+    route.side_effect = [
+        httpx.Response(200, text=openrouter_stream(*REPLY), headers={"content-type": "text/event-stream"}),
+        httpx.Response(500, json={"error": {"message": "upstream down"}}),
+    ]
+    session_id = start_session(client, world)
+    client.post(f"/api/sessions/{session_id}/turn", json={"text": "Hello Mira."})
+    before = _turn_state(engine, session_id)
+
+    events = sse_events(client.post(f"/api/sessions/{session_id}/regenerate").text)
+    assert events[-1][0] == "error"
+    turn_count, labels, messages = _turn_state(engine, session_id)
+    assert (turn_count, labels, sorted(messages)) == (before[0], before[1], sorted(before[2]))
+
+
+@respx.mock
+async def test_stopped_stream_undoes_the_turn(harness, world, engine):
+    respx.route(host="sage.test").mock(side_effect=FakeSage(world).handler)
+    mock_openrouter()
+    with Session(engine) as db:
+        session = TrainingSession(scenario_id=world["scenario_id"], persona_id=world["persona_id"])
+        db.add(session)
+        db.commit()
+        session_id = session.id
+    before = _turn_state(engine, session_id)
+
+    events = harness.run_turn(session_id, "Hello Mira.")
+    first = await events.__anext__()
+    assert first["event"] == "harness"
+    await events.aclose()  # the browser pressed Stop before the reply was saved
+    assert _turn_state(engine, session_id) == before
+
+
+@respx.mock
+async def test_post_turn_finishes_when_the_stream_closes_after_done(harness, world, engine):
+    respx.route(host="sage.test").mock(side_effect=FakeSage(world).handler)
+    mock_openrouter()
+    with Session(engine) as db:
+        session = TrainingSession(scenario_id=world["scenario_id"], persona_id=world["persona_id"])
+        db.add(session)
+        db.commit()
+        session_id = session.id
+
+    events = harness.run_turn(session_id, "Hello Mira.")
+    async for event in events:
+        if event["event"] == "done":
+            break
+    await events.aclose()
+    await asyncio.gather(*harness._background)
+    with Session(engine) as db:
+        trace = db.exec(select(TurnTrace).where(TurnTrace.session_id == session_id)).first()
+    assert "post_turn" in trace.data

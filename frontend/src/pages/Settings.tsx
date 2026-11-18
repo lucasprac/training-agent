@@ -48,7 +48,7 @@ export default function Settings() {
         </section>
 
         <section className="card stack">
-          <h2>{t('Narrator model (global)')}</h2>
+          <h2>{t('Simulation model (global)')}</h2>
           <div className="row">
             <span>{t('Current:')} <strong>{currentModel || '—'}</strong></span>
             {selectedInfo?.context_length && <span className="badge">{t('{n} ctx', { n: selectedInfo.context_length.toLocaleString(lang) })}</span>}
@@ -73,6 +73,12 @@ export default function Settings() {
               value={preset.sage_reasoning}
               options={[{ value: 'off', label: t('off (fast)') }, { value: 'auto', label: t('auto') }, { value: 'on', label: t('on (slow)') }]}
               onChange={(v) => set('sage_reasoning', v)}
+            />
+            <SelectField
+              label={t('Sage reasoning for the evaluation')}
+              value={preset.evaluation_reasoning}
+              options={[{ value: 'off', label: t('off (fast)') }, { value: 'auto', label: t('auto') }, { value: 'on', label: t('on (slow)') }]}
+              onChange={(v) => set('evaluation_reasoning', v)}
             />
           </div>
         </section>

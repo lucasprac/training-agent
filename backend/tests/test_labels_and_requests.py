@@ -93,9 +93,9 @@ def test_pre_turn_request_from_registry_and_limits():
 
 
 def test_locked_labels_are_not_asked_and_empty_pools_skip():
-    built = build_pre_turn("VIEW", _ctx(), locked={"scene.mood", "select.lore"})
+    built = build_pre_turn("VIEW", _ctx(), locked={"scene.tone", "select.lore"})
     keys = set(built.qid_to_key.values())
-    assert "scene.mood" not in keys
+    assert "scene.tone" not in keys
     assert "select.lore" not in keys  # empty pool (and not lockable anyway)
     assert "select.memory" not in keys
 

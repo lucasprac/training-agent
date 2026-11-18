@@ -37,23 +37,26 @@ def set_engine(engine: Engine) -> None:
     _engine = engine
 
 
-def init_db(engine: Engine | None = None) -> None:
+def init_db(engine: Engine | None = None, sample_data: bool | None = None) -> None:
+    """Create tables and seed defaults. `sample_data` defaults to the SAMPLE_DATA setting."""
     from app import models  # noqa: F401  (register tables)
     from app.seed import seed_defaults
+    from app.seed_library import seed_library
+    from app.seed_sample import seed_sample
 
     engine = engine or get_engine()
     SQLModel.metadata.create_all(engine)
     _add_missing_columns(engine)
     with Session(engine) as db:
-        _scope_global_personas(db)
         seed_defaults(db)
+        seed_library(db)
+        if get_settings().sample_data if sample_data is None else sample_data:
+            seed_sample(db)
 
 
-# create_all() never alters an existing table, so columns added after the first release are added here.
-_ADDED_COLUMNS: dict[str, dict[str, str]] = {
-    "scenario": {"themes": "JSON NOT NULL DEFAULT '[]'"},
-    "persona": {"scenario_id": "INTEGER"},
-}
+# create_all() never alters an existing table, so columns added after the first release are added here:
+# {"table": {"column": "SQLite DDL"}}.
+_ADDED_COLUMNS: dict[str, dict[str, str]] = {}
 
 
 def _add_missing_columns(engine: Engine) -> None:
@@ -63,33 +66,6 @@ def _add_missing_columns(engine: Engine) -> None:
             for name, ddl in columns.items():
                 if name not in existing:
                     conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
-
-
-def _scope_global_personas(db: Session) -> None:
-    """Personas belong to one scenario. Copy each old global persona into every scenario,
-    point existing sessions at their scenario's copy, then remove the global rows."""
-    from sqlmodel import select
-
-    from app.models import Persona, RoleplaySession, Scenario
-
-    globals_ = list(db.exec(select(Persona).where(Persona.scenario_id == None)))  # noqa: E711
-    scenarios = list(db.exec(select(Scenario)))
-    if not globals_ or not scenarios:
-        return
-    for scenario in scenarios:
-        copies: dict[int, int] = {}
-        for persona in globals_:
-            copy = Persona(scenario_id=scenario.id, name=persona.name, description=persona.description)
-            db.add(copy)
-            db.flush()
-            copies[persona.id] = copy.id
-        for session in db.exec(select(RoleplaySession).where(RoleplaySession.scenario_id == scenario.id)):
-            if session.persona_id in copies:
-                session.persona_id = copies[session.persona_id]
-                db.add(session)
-    for persona in globals_:
-        db.delete(persona)
-    db.commit()
 
 
 def get_db() -> Iterator[Session]:

@@ -1,21 +1,16 @@
 {
-  "1": "Frontend API Types",
-  "2": "HTTP Routes",
   "3": "Prompt Assembler",
   "6": "World Info Activation",
   "8": "Frontend Dependencies",
   "9": "Architecture Docs",
   "11": "TS App Config",
-  "12": "SillyTavern Card Import",
   "13": "TS Node Config",
   "14": "CRUD Router Factory",
   "15": "Oxlint Rules",
   "17": "TS Project References",
   "18": "API Package",
   "19": "Clients Package",
-  "20": "Importers Package",
   "21": "Prompt Package",
   "22": "World Info Package",
-  "23": "Backend Project",
   "24": "Out of Scope Features"
 }

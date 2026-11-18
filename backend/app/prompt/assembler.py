@@ -18,12 +18,14 @@ from app.models import (
     Persona,
     PromptPreset,
     Scenario,
+    StateVariable,
 )
 from app.prompt.blocks import BLOCK_IDS, normalize_block_order
 from app.prompt.budget import MESSAGE_OVERHEAD_TOKENS, estimate_messages, estimate_tokens
 from app.prompt.macros import expand
 from app.sage.labels import LabelSet
 from app.sage.registry import ELSEWHERE
+from app.training.state import state_lines
 
 ROLE_RANK = {"user": 0, "assistant": 1, "system": 2}
 
@@ -62,6 +64,7 @@ class AssemblyInput:
     ooc: bool = False
     rng: random.Random | None = None
     now: datetime | None = None
+    state_variables: list[StateVariable] = field(default_factory=list)
 
 
 @dataclass
@@ -130,8 +133,8 @@ def macro_values(inp: AssemblyInput) -> dict[str, str]:
         "char": char,
         "scenario": inp.scenario.world,
         "location": "" if location == ELSEWHERE else str(location),
-        "mood": str(inp.labels.value("scene.mood", "")),
-        "scene_type": str(inp.labels.value("scene.type", "")),
+        "stage": str(inp.labels.value("scene.stage", "")),
+        "tone": str(inp.labels.value("scene.tone", "")),
         "present": ", ".join(names),
     }
 
@@ -237,7 +240,7 @@ class _Renderer:
 
     def scene_note(self) -> str:
         labels = self.inp.labels
-        keys = ("scene.location", "scene.type", "scene.mood", "scene.present")
+        keys = ("scene.location", "scene.stage", "scene.tone", "scene.present")
         # Only labels that are rendered (have a value) can make the scene tentative.
         tentative = any(
             (label := labels.get(k)) is not None and label.value is not None and label.certainty != "high"
@@ -251,11 +254,14 @@ class _Renderer:
             "scene",
             "",
             location=location,
-            type=labels.value("scene.type"),
-            mood=labels.value("scene.mood"),
+            stage=labels.value("scene.stage"),
+            tone=labels.value("scene.tone"),
             present=present_names or None,
             certainty="tentative" if tentative else None,
         )
+        sim_state = state_lines(self.inp.state_variables, labels, narrator_only=True)
+        if sim_state:
+            scene += "\n" + _tag("sim_state", "\n".join(sim_state))
         guidance = [self.x(g) for g in self.inp.guidance if g.strip()]
         if guidance:
             scene += "\n" + _tag("guidance", "\n".join(f"- {g}" for g in guidance))

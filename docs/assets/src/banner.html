@@ -1,0 +1,110 @@
+<!doctype html>
+<!--
+  Source of the README banners and the GitHub social preview.
+  Render with headless Chrome (see docs/assets/src/README.md):
+    banner.html?theme=light&size=banner   -> 1280x420
+    banner.html?theme=dark&size=banner    -> 1280x420
+    banner.html?theme=light&size=social   -> 1280x640
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root {
+    --bg: #f6f3ee; --panel: #fffdf9; --text: #2a2622; --muted: #7a7168; --border: #e2dbd0;
+    --accent: #b5532a; --accent-soft: rgba(181, 83, 42, 0.10); --ok: #3f7d4e; --ok-soft: rgba(63,125,78,.12);
+    --bubble: #efe6da; --narration: #5e564e; --dot: rgba(42, 38, 34, 0.07);
+    --serif: 'Iowan Old Style', 'Palatino Linotype', Palatino, Georgia, serif;
+    --sans: 'Segoe UI', system-ui, Roboto, sans-serif;
+    --mono: 'Cascadia Code', Consolas, ui-monospace, monospace;
+  }
+  .dark {
+    --bg: #14120f; --panel: #1c1916; --text: #e9e2d8; --muted: #9b9083; --border: #332d27;
+    --accent: #e0814f; --accent-soft: rgba(224,129,79,.12); --ok: #6fbf82; --ok-soft: rgba(111,191,130,.12);
+    --bubble: #2b2621; --narration: #b3a89a; --dot: rgba(233, 226, 216, 0.06);
+  }
+  * { box-sizing: border-box; margin: 0; }
+  html, body { width: 1280px; overflow: hidden; }
+  body {
+    height: var(--h); background: var(--bg); color: var(--text); font-family: var(--sans);
+    background-image:
+      radial-gradient(900px 500px at 88% 10%, var(--accent-soft), transparent 60%),
+      radial-gradient(var(--dot) 1.2px, transparent 1.2px);
+    background-size: auto, 22px 22px;
+    display: grid; grid-template-columns: 1fr 470px; align-items: center; gap: 56px;
+    padding: 0 72px;
+  }
+  .brand { display: flex; align-items: center; gap: 22px; }
+  .brand img { width: 84px; height: 84px; filter: drop-shadow(0 8px 18px rgba(156,68,33,.25)); }
+  .word { white-space: nowrap; font-family: var(--serif); font-size: 66px; font-weight: 600; letter-spacing: -0.5px; line-height: 1; }
+  .word span { color: var(--accent); }
+  .tag { margin-top: 26px; font-size: 25px; line-height: 1.4; color: var(--narration); max-width: 600px; }
+  .tag b { color: var(--text); font-weight: 600; }
+  .pills { margin-top: 26px; display: flex; flex-wrap: wrap; gap: 10px; }
+  .pill { font-size: 15px; padding: 7px 14px; border-radius: 999px; border: 1px solid var(--border); background: var(--panel); color: var(--muted); }
+  .pill i { font-style: normal; color: var(--accent); margin-right: 6px; }
+
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 18px; padding: 22px 24px;
+          box-shadow: 0 24px 60px rgba(42,38,34,.12), 0 2px 6px rgba(42,38,34,.06); }
+  .dark .card { box-shadow: 0 24px 60px rgba(0,0,0,.45); }
+  .lbl { font-size: 11.5px; letter-spacing: 1.4px; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
+  .narr { font-family: var(--serif); font-style: italic; color: var(--narration); font-size: 16px; }
+  .say { font-family: var(--serif); font-size: 18px; line-height: 1.45; margin-bottom: 16px; }
+  .bubble { background: var(--bubble); border-radius: 12px; padding: 12px 14px; font-family: var(--serif); font-size: 17.5px; line-height: 1.45; }
+  .eval { margin-top: 16px; border-top: 1px dashed var(--border); padding-top: 14px; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+  .name { font-weight: 600; font-size: 16px; }
+  .chip { font-family: var(--mono); font-size: 13px; color: var(--ok); border: 1px solid var(--ok); background: var(--ok-soft); border-radius: 999px; padding: 2px 9px; }
+  .bar { height: 8px; border-radius: 99px; background: var(--border); overflow: hidden; }
+  .bar div { height: 100%; width: 87%; background: var(--ok); border-radius: 99px; }
+  .ev { margin-top: 10px; font-size: 14px; color: var(--muted); }
+  .ev q { color: var(--text); font-family: var(--serif); font-style: italic; }
+
+  /* social preview: taller canvas, larger type, repo URL at the bottom */
+  body.social { grid-template-columns: 1fr 460px; padding: 0 80px; }
+  body.social .word { font-size: 62px; }
+  body.social .tag { font-size: 27px; }
+  body.social .foot { position: absolute; left: 80px; bottom: 42px; font-family: var(--mono); font-size: 18px; color: var(--muted); }
+  .foot { display: none; }
+  body.social .foot { display: block; }
+</style>
+</head>
+<body>
+  <main>
+    <div class="brand">
+      <img src="../logo.svg" alt="">
+      <div class="word">Training <span>Agent</span></div>
+    </div>
+    <p class="tag">Practise real work conversations with AI counterparts. <b>Get scored on your company's own rubrics, with evidence.</b></p>
+    <div class="pills">
+      <span class="pill"><i>&#9670;</i>Scenario builder</span>
+      <span class="pill"><i>&#9670;</i>AI counterparts</span>
+      <span class="pill"><i>&#9670;</i>Rubric scoring</span>
+      <span class="pill"><i>&#9670;</i>Evidence-based reports</span>
+    </div>
+  </main>
+
+  <aside class="card">
+    <div class="lbl">Customer</div>
+    <p class="narr">Carla opens the support chat.</p>
+    <p class="say">My order arrived broken. Again. What are you going to do about it?</p>
+    <div class="lbl">Trainee</div>
+    <div class="bubble">I'm truly sorry, Carla. Twice in a row is really frustrating. Can you send me the order number so I can fix this now?</div>
+    <div class="eval">
+      <div class="row"><span class="name">Empathy</span><span class="chip">87%</span></div>
+      <div class="bar"><div></div></div>
+      <p class="ev">Names and validates the emotion &middot; <q>Twice in a row is really frustrating.</q></p>
+    </div>
+  </aside>
+
+  <div class="foot">github.com/lucasprac/training-agent</div>
+
+<script>
+  const q = new URLSearchParams(location.search);
+  if (q.get('theme') === 'dark') document.documentElement.classList.add('dark');
+  const social = q.get('size') === 'social';
+  if (social) document.body.classList.add('social');
+  document.documentElement.style.setProperty('--h', social ? '640px' : '420px');
+</script>
+</body>
+</html>

@@ -88,7 +88,7 @@ export default function PromptManager() {
         <h1>{t('Prompt Manager')}</h1>
         <p className="muted small">
           {withNode(
-            t('The global preset applies to every roleplay. Scenarios can override the main prompt and the post-history instructions (with {original}) and add scenario rules, but they cannot remove the global rules.'),
+            t('The global preset applies to every simulation. Scenarios can override the main prompt and the post-history instructions (with {original}) and add scenario rules, but they cannot remove the global rules.'),
             'original',
             <code>{'{{original}}'}</code>,
           )}

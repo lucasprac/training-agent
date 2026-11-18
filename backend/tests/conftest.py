@@ -21,7 +21,7 @@ OPENROUTER = "https://openrouter.test/api/v1"
 def engine():
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     app_db.set_engine(engine)
-    app_db.init_db(engine)
+    app_db.init_db(engine, sample_data=False)
     yield engine
     app_db.set_engine(None)
 
@@ -35,6 +35,7 @@ def settings():
         sage_base_url=SAGE,
         default_model="test/narrator",
         summary_model="test/summary",
+        sample_data=False,
         _env_file=None,
     )
 

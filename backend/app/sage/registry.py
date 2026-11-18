@@ -9,7 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from app.models import Character, LoreEntry, MemoryItem
+from app.models import Character, LoreEntry, MemoryItem, StateVariable
 
 Kind = Literal["yesno", "choice", "scale", "tags"]
 Phase = Literal["pre_turn", "post_turn"]
@@ -18,26 +18,24 @@ NullPolicy = Literal["carry", "include", "exclude", "caution", "include_keyword_
 UNCHANGED = "unchanged"
 ELSEWHERE = "elsewhere"
 
-SCENE_TYPES = [
-    ("dialogue", "characters mainly talk"),
-    ("combat", "a fight or physical struggle"),
-    ("exploration", "searching, investigating or discovering a place"),
-    ("travel", "moving from one place to another"),
-    ("rest", "a quiet pause, recovery or downtime"),
-    ("romance", "affection, flirting or intimacy"),
-    ("intrigue", "deception, negotiation, secrets or scheming"),
+STAGES = [
+    ("opening", "greetings, introductions or setting the context"),
+    ("discovery", "questions to understand the situation, the problem or the needs"),
+    ("proposal", "a solution, an option or a plan is presented"),
+    ("objection", "a concern, pushback or disagreement is raised or handled"),
+    ("negotiation", "terms, concessions or trade-offs are discussed"),
+    ("closing", "an agreement, a decision or the next steps are confirmed"),
     ("other", "none of the above"),
 ]
 
-MOODS = [
-    ("calm", "peaceful, relaxed"),
-    ("tense", "danger or conflict is close"),
-    ("playful", "light, humorous"),
-    ("romantic", "warm, intimate"),
-    ("somber", "sad, grieving, heavy"),
-    ("eerie", "uncanny, unsettling, mysterious"),
-    ("chaotic", "loud, frantic, out of control"),
-    ("triumphant", "victory, relief, celebration"),
+TONES = [
+    ("cooperative", "the counterparts are open, friendly and willing to work together"),
+    ("neutral", "the counterparts are polite but reserved"),
+    ("skeptical", "the counterparts doubt what they hear and want proof"),
+    ("frustrated", "the counterparts are unhappy or impatient but still talk"),
+    ("angry", "the counterparts are hostile, raise their voice or threaten"),
+    ("anxious", "the counterparts are worried, insecure or afraid"),
+    ("satisfied", "the counterparts are pleased or relieved"),
 ]
 
 
@@ -85,12 +83,12 @@ def _location_options(ctx: SageContext) -> dict[str, Any]:
     return {"options": options}
 
 
-def _scene_type_options(_: SageContext) -> dict[str, Any]:
-    return {"options": [{"option": o, "description": d} for o, d in SCENE_TYPES]}
+def _stage_options(_: SageContext) -> dict[str, Any]:
+    return {"options": [{"option": o, "description": d} for o, d in STAGES]}
 
 
-def _mood_options(_: SageContext) -> dict[str, Any]:
-    return {"options": [{"option": o, "description": d} for o, d in MOODS]}
+def _tone_options(_: SageContext) -> dict[str, Any]:
+    return {"options": [{"option": o, "description": d} for o, d in TONES]}
 
 
 def _present_tags(ctx: SageContext) -> dict[str, Any] | None:
@@ -134,12 +132,12 @@ def _known_by_tags(ctx: SageContext) -> dict[str, Any] | None:
 
 
 MEMORY_KINDS_OPTIONS = [
-    ("fact", "reveals or establishes a lasting fact about the world, a place or a character"),
-    ("relationship", "shows a change in how two characters feel about or treat each other"),
-    ("item", "an object is given, taken, found, used up or lost"),
-    ("goal", "a character states a goal, plan, deal or promise"),
-    ("event", "a significant event happens that later scenes may refer to"),
-    ("none", "description, atmosphere, small talk or anything not worth remembering"),
+    ("fact", "reveals or establishes a lasting fact about the situation, the company, a product or a person"),
+    ("relationship", "shows a change in how two people feel about or treat each other"),
+    ("item", "a document, product, object or value is given, sent, promised, found or lost"),
+    ("goal", "someone states a goal, plan, deal, commitment or promise"),
+    ("event", "a significant event happens that later messages may refer to"),
+    ("none", "description, small talk or anything not worth remembering"),
 ]
 
 
@@ -150,7 +148,7 @@ def _memory_kind_options(_: SageContext) -> dict[str, Any]:
 def _stalling_levels(_: SageContext) -> dict[str, Any]:
     return {
         "levels": [
-            {"level": 0, "description": "the story moves well"},
+            {"level": 0, "description": "the conversation moves well"},
             {"level": 1, "description": "a little slow"},
             {"level": 2, "description": "repetitive, little progress"},
             {"level": 3, "description": "stalling, nothing new happens"},
@@ -194,22 +192,22 @@ REGISTRY: list[QuestionSpec] = [
         build=_location_options,
     ),
     QuestionSpec(
-        key="scene.type",
+        key="scene.stage",
         kind="choice",
         phase="pre_turn",
-        instructions="What kind of scene is it now, after the LAST message?",
+        instructions="Which stage of the conversation is it now, after the LAST message?",
         null_policy="carry",
-        renders_to='<scene type="…">, {{scene_type}}',
-        build=_scene_type_options,
+        renders_to='<scene stage="…">, {{stage}}',
+        build=_stage_options,
     ),
     QuestionSpec(
-        key="scene.mood",
+        key="scene.tone",
         kind="choice",
         phase="pre_turn",
-        instructions="What is the mood of the scene now, after the LAST message?",
+        instructions="What is the tone of the counterparts (everyone except {user}) now, after the LAST message?",
         null_policy="carry",
-        renders_to='<scene mood="…">, {{mood}}',
-        build=_mood_options,
+        renders_to='<scene tone="…">, {{tone}}',
+        build=_tone_options,
     ),
     QuestionSpec(
         key="scene.present",
@@ -256,7 +254,7 @@ REGISTRY: list[QuestionSpec] = [
         kind="choice",
         phase="post_turn",
         instructions=(
-            "The SENTENCE below comes from the exchange above. Should the story remember it "
+            "The SENTENCE below comes from the exchange above. Should the simulation remember it "
             "later, and as what kind of memory?"
         ),
         null_policy="exclude",
@@ -282,7 +280,7 @@ REGISTRY: list[QuestionSpec] = [
         key="pacing.stalling",
         kind="scale",
         phase="post_turn",
-        instructions="How much is the story stalling in these recent messages?",
+        instructions="How much is the conversation stalling in these recent messages?",
         null_policy="carry",
         renders_to="next turn <guidance>",
         build=_stalling_levels,
@@ -291,6 +289,58 @@ REGISTRY: list[QuestionSpec] = [
 ]
 
 BY_KEY: dict[str, QuestionSpec] = {spec.key: spec for spec in REGISTRY}
+
+
+# ----------------------------------------------------------------- scenario state variables
+
+STATE_CHOICE_THRESHOLD = 0.7
+MIN_OPTIONS = 2
+
+
+def _state_build(variable: StateVariable) -> Callable[[SageContext], dict[str, Any] | None]:
+    def build(_: SageContext) -> dict[str, Any] | None:
+        if variable.kind == "choice":
+            options = [
+                {"option": str(o.get("option", "")).strip(), "description": str(o.get("description", ""))}
+                for o in variable.options[:120]
+                if str(o.get("option", "")).strip()
+            ]
+            return {"options": options} if len(options) >= MIN_OPTIONS else None
+        if variable.kind == "scale":
+            levels = [
+                {"level": o["level"], "description": str(o.get("description", ""))}
+                for o in variable.options[:26]
+                if isinstance(o.get("level"), int)
+            ]
+            return {"levels": levels} if len(levels) >= MIN_OPTIONS else None
+        return {}
+
+    return build
+
+
+def state_specs(variables: list[StateVariable]) -> list[QuestionSpec]:
+    """One pre-turn question per enabled Decide variable (choice, scale, yesno).
+
+    Extract variables go to /v1/extract instead (see `app.sage.extract.state_schema`).
+    """
+    specs: list[QuestionSpec] = []
+    for variable in sorted(variables, key=lambda v: (v.order, v.id or 0)):
+        if not variable.enabled or variable.kind not in ("choice", "scale", "yesno"):
+            continue
+        instructions = variable.instructions.strip() or f"What is the current value of '{variable.name}', after the LAST message?"
+        specs.append(
+            QuestionSpec(
+                key=f"state.{variable.id}",
+                kind=variable.kind,  # type: ignore[arg-type]
+                phase="pre_turn",
+                instructions=instructions,
+                null_policy="carry",
+                renders_to="<sim_state>" if variable.tell_narrator else "report only",
+                threshold=STATE_CHOICE_THRESHOLD,
+                build=_state_build(variable),
+            )
+        )
+    return specs
 
 
 def question_id(label_key: str) -> str:

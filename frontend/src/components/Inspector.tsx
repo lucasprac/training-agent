@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react'
 import {
   api,
   type Character,
+  type Competency,
+  type Evaluation,
   type HarnessStatePublic,
   type Label,
   type LabelSet,
@@ -10,13 +12,15 @@ import {
   type PromptPublic,
   type RegistryEntry,
   type RpSession,
+  type RubricLevel,
+  type StateVariable,
 } from '../api'
 import { CheckField, NumberField, TextField } from './Field'
 import { useI18n, type MessageKey } from '../i18n'
 
 type Names = Record<number, string>
 
-type Translate = (key: MessageKey) => string
+type Translate = (key: MessageKey, vars?: Record<string, string | number>) => string
 
 function fmt(value: unknown, names: Names, t: Translate): string {
   if (value === null || value === undefined) return '—'
@@ -107,6 +111,12 @@ export function HarnessPanel({ state, report, names }: { state: HarnessStatePubl
               {m.known_by.length > 0 ? <span className="badge warn">{t('known by {names}', { names: fmt(m.known_by, names, t) })}</span> : <span className="badge">{t('shared')}</span>}
             </div>
           ))}
+          {report.evaluation && (
+            <div className="small">
+              {t('Evaluated competencies: {n}', { n: report.evaluation.competencies })}
+              {report.evaluation.needs_review > 0 && <> <span className="badge warn">{t('{n} for review', { n: report.evaluation.needs_review })}</span></>}
+            </div>
+          )}
           {report.stalling !== undefined && <div className="small">{t('Stalling: {n} / 4', { n: report.stalling })}</div>}
           {report.location && <div className="small">{t('Location from extract: {location}', { location: report.location })}</div>}
           {report.summarized_upto_turn !== undefined && <div className="small">{t('Summary updated up to turn {n}', { n: report.summarized_upto_turn })}</div>}
@@ -276,6 +286,120 @@ function LabelEditor({ spec, label, characters, onLock, onUnlock }: {
     <div className="row small">
       <input style={{ flex: 1 }} value={text} onChange={(e) => setText(e.target.value)} placeholder={t('value')} />
       <button className="small" disabled={!text.trim()} onClick={() => onLock(text.trim())}>{t('Lock')}</button>
+    </div>
+  )
+}
+
+function stateText(variable: StateVariable, value: unknown, t: Translate): string {
+  if (value === null || value === undefined) return '—'
+  if (typeof value === 'boolean') return value ? t('yes') : t('no')
+  if (variable.kind === 'scale' && typeof value === 'number' && variable.options.length) {
+    const levels = variable.options as RubricLevel[]
+    const nearest = levels.reduce((a, b) => (Math.abs(b.level - value) < Math.abs(a.level - value) ? b : a))
+    return `${nearest.description} (${value})`
+  }
+  if (typeof value === 'object') return JSON.stringify(value)
+  return String(value)
+}
+
+/** The scenario's state variables in this session. A manager can lock a value while testing. */
+export function StatePanel({ sessionId, variables, labels, onChange }: {
+  sessionId: number
+  variables: StateVariable[]
+  labels: LabelSet | null
+  onChange: () => void
+}) {
+  const { t } = useI18n()
+  const patch = async (key: string, body: { value?: unknown; locked: boolean }) => {
+    await api.patch(`/sessions/${sessionId}/labels`, { key, ...body })
+    onChange()
+  }
+  if (variables.length === 0) return <p className="muted small">{t('This scenario has no state variables.')}</p>
+  return (
+    <div className="stack">
+      <p className="small muted">{t('Sage updates these values before each reply. Visible values go to the counterparts in <sim_state>; hidden ones only go to the report.')}</p>
+      {variables.map((v) => {
+        const key = v.key ?? `state.${v.id}`
+        const label = labels?.labels[key]
+        return (
+          <div key={v.id} className="card stack" style={{ padding: 10, gap: 6 }}>
+            <div className="row small">
+              <strong>{v.name}</strong>
+              <span className="badge">{v.kind}</span>
+              {v.is_objective && <span className="badge accent">{t('objective')}</span>}
+              {!v.tell_narrator && <span className="badge">{t('hidden')}</span>}
+              <span className="spacer" />
+              {label && <CertaintyBadge label={label} />}
+            </div>
+            <div className="small">
+              {stateText(v, label?.value, t)}{' '}
+              {label?.probability != null && <span className="muted">p={label.probability.toFixed(2)}</span>}{' '}
+              {label && <span className="muted">{t('· source {source} · turn {n}', { source: label.source, n: label.turn })}</span>}
+            </div>
+            {label?.locked ? (
+              <div><button className="small" onClick={() => patch(key, { locked: false })}>{t('Unlock')}</button></div>
+            ) : v.kind === 'yesno' ? (
+              <div className="row small">
+                <button className="small" onClick={() => patch(key, { value: true, locked: true })}>{t('Lock yes')}</button>
+                <button className="small" onClick={() => patch(key, { value: false, locked: true })}>{t('Lock no')}</button>
+              </div>
+            ) : (
+              <StateLockInput onLock={(value) => patch(key, { value: v.kind === 'scale' && !Number.isNaN(Number(value)) ? Number(value) : value, locked: true })} />
+            )}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+function StateLockInput({ onLock }: { onLock: (value: string) => void }) {
+  const { t } = useI18n()
+  const [text, setText] = useState('')
+  return (
+    <div className="row small">
+      <input style={{ flex: 1 }} value={text} onChange={(e) => setText(e.target.value)} placeholder={t('value')} />
+      <button className="small" disabled={!text.trim()} onClick={() => onLock(text.trim())}>{t('Lock')}</button>
+    </div>
+  )
+}
+
+/** Sage's evaluation of each trainee message (manager view while testing). */
+export function EvaluationPanel({ sessionId, competencies, refreshKey }: { sessionId: number; competencies: Competency[]; refreshKey: number }) {
+  const { t } = useI18n()
+  const [rows, setRows] = useState<Evaluation[]>([])
+  useEffect(() => {
+    api.get<Evaluation[]>(`/sessions/${sessionId}/evaluations`).then(setRows).catch(() => setRows([]))
+  }, [sessionId, refreshKey])
+  const byId = Object.fromEntries(competencies.map((c) => [c.id, c]))
+  if (rows.length === 0) return <p className="muted small">{t('No evaluations yet. Sage evaluates each trainee message after the reply.')}</p>
+  const turns = [...new Set(rows.map((r) => r.turn_index))].sort((a, b) => b - a)
+  return (
+    <div className="stack">
+      {turns.map((turn) => (
+        <div key={turn} className="stack" style={{ gap: 6 }}>
+          <h3>{t('turn {n}', { n: turn })}</h3>
+          {rows.filter((r) => r.turn_index === turn).map((r) => {
+            const c = byId[r.competency_id]
+            const max = c ? Math.max(...c.levels.map((l) => l.level)) : 4
+            const shown = r.indicators.filter((i) => i.applies).map((i) => c?.indicators.find((x) => x.id === i.id)?.text ?? i.id)
+            return (
+              <div key={r.id} className="card stack" style={{ padding: 10, gap: 4 }}>
+                <div className="row small">
+                  <strong style={{ flex: 1 }}>{c?.name ?? `#${r.competency_id}`}</strong>
+                  <span className="badge">{r.score === null ? '—' : `${r.score.toFixed(1)} / ${max}`}</span>
+                  {r.confidence !== null && <span className="muted">c={r.confidence.toFixed(2)}</span>}
+                  {r.source === 'manager' && <span className="badge accent">{t('corrected')}</span>}
+                  {r.needs_review && <span className="badge warn">{t('review')}</span>}
+                </div>
+                {r.review_reason && <div className="small warn-text">{r.review_reason}</div>}
+                {shown.length > 0 && <div className="small muted">{shown.join(' · ')}</div>}
+                {r.evidence.map((e, i) => <div key={i} className="small quote">“{e.text}”</div>)}
+              </div>
+            )
+          })}
+        </div>
+      ))}
     </div>
   )
 }
